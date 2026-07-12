@@ -7,12 +7,12 @@ $inactive-tab-text-color = $inactive-link-color
 $inactive-tab-text-color-darktheme = $inactive-link-color-darktheme
 
 /* latin */
-@font-face
-    font-family: 'Open Sans'
-    font-style: normal
-    font-weight: 400
-    src: local('Open Sans'), local('OpenSans'), url(../fonts/open_sans.woff2) format('woff2')
-    unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02C6, U+02DA, U+02DC, U+2000-206F, U+2074, U+20AC, U+2212, U+2215, U+E0FF, U+EFFD, U+F000
+// @font-face
+//    font-family: 'Open Sans'
+//    font-style: normal
+//    font-weight: 400
+//    src: local('Open Sans'), local('OpenSans'), url(../fonts/open_sans.woff2) format('woff2')
+//    unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02C6, U+02DA, U+02DC, U+2000-206F, U+2074, U+20AC, U+2212, U+2215, U+E0FF, U+EFFD, U+F000
 
 /* make <body> cover entire viewport */
 html
@@ -25,13 +25,14 @@ body
     overflow-y: scroll
     margin: 0
     color: $text-color
-    font-family: 'Open Sans', sans-serif
+    font-family: 'EB Garamond', serif
+    letter-spacing: 2%
     font-size: 1em
     line-height: 1.4
     @media (max-width: 800px)
         font-size: 0.875em
     @media (max-width: 1200px)
-        font-size: 0.95em
+        font-size: 1em /* 0.95em */
 
 body.darktheme
     color: $text-color-darktheme
@@ -40,6 +41,7 @@ body.darktheme
 h1, h2, h3
     font-weight: normal
     margin-bottom: 1em
+    font-style: italic
 
 h1
     font-size: 2em
