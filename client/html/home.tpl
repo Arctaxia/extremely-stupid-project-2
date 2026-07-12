@@ -1,7 +1,8 @@
 <div class='content-wrapper transparent-container' id='home'>
     <div class='messages'></div>
     <header>
-        <h1><%- ctx.name %></h1>
+        <img src="img/apple-touch-icon.png" style="text-align:center;">
+        <div style="letter-spacing: 3px;"><%- ctx.name %></div>
     </header>
     <% if (ctx.canListPosts) { %>
         <form class='horizontal'>
