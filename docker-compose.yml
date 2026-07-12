@@ -4,9 +4,8 @@
 # orchestration services
 services:
   server:
-    image: oxibooru/server:latest
     build:
-      context: server
+      context: ./server
       args: 
         # Setting this to `native` can give small performance gains for some 
         # operations such as reverse search, but makes binary less portable.
@@ -29,8 +28,10 @@ services:
     stop_signal: SIGINT
 
   client:
-    image: oxibooru/client:latest
-    build: client
+    build:
+      context: ./client
+      args:
+        BUILD_INFO: latest
     depends_on:
       - server
     environment:
