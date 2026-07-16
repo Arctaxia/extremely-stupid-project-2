@@ -7,12 +7,12 @@ $inactive-tab-text-color = $inactive-link-color
 $inactive-tab-text-color-darktheme = $inactive-link-color-darktheme
 
 /* latin */
-// @font-face
-//    font-family: 'Open Sans'
-//    font-style: normal
-//    font-weight: 400
-//    src: local('Open Sans'), local('OpenSans'), url(../fonts/open_sans.woff2) format('woff2')
-//    unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02C6, U+02DA, U+02DC, U+2000-206F, U+2074, U+20AC, U+2212, U+2215, U+E0FF, U+EFFD, U+F000
+ @font-face
+    font-family: 'Open Sans'
+    font-style: normal
+    font-weight: 400
+    src: local('Open Sans'), local('OpenSans'), url(../fonts/open_sans.woff2) format('woff2')
+    unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02C6, U+02DA, U+02DC, U+2000-206F, U+2074, U+20AC, U+2212, U+2215, U+E0FF, U+EFFD, U+F000
 
 /* make <body> cover entire viewport */
 html
@@ -26,8 +26,8 @@ body
     margin: 0
     color: $text-color
     font-family: 'EB Garamond', serif
-    letter-spacing: 2%
-    font-size: 1em
+    letter-spacing: 3%
+    font-size: 1.1em
     line-height: 1.4
     @media (max-width: 800px)
         font-size: 0.875em
@@ -73,11 +73,31 @@ a
     .vim-nav-hint
         position: absolute
         visibility: hidden
-.darktheme a
+
+.darktheme a:not([class*="tag"])
+    color: $main-color-darktheme
     &.inactive
         color: $inactive-link-color-darktheme
     &.icon
         color: $inactive-link-color-darktheme
+
+.darktheme a[class="tag-default"]
+        color: $main-color-darktheme
+
+/* I don't know where else I should put these (outline for tags, smallcaps-ifying thumbnail label font) */
+ul.compact-tags li a 
+  display: inline
+  text-shadow: 0px 0px 0.5px black
+
+.type 
+  font-variant: small-caps
+  text-transform: capitalize
+/* --- */
+
+/* Rounded corners for avatars. */
+li[data-name="account"] span.thumbnail, div#user-summary span.thumbnail, div.avatar span.thumbnail, div.user-list span.thumbnail {
+  border-radius: 10%;
+}
 
 a.append, span.append
     margin-left: 1em
@@ -95,6 +115,7 @@ form .fa-question-circle-o
         text-align: left
         display: inline-block
         margin: 0 auto
+        border-radius: 10px
         >*:first-child, form h1
             margin-top: 0
         nav.buttons

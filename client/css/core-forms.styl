@@ -72,6 +72,10 @@ input[type=radio], input[type=checkbox]
     &:hover:before
         border-color: $main-color
 
+.darktheme .radio, .darktheme .checkbox
+    &:hover:before
+        border-color: $main-color-darktheme
+
 .radio:before
     border-radius: 100%
 
@@ -101,6 +105,9 @@ input[type=radio], input[type=checkbox]
     content: ''
     opacity: 0
 
+.darktheme .radio:after
+    background: $main-color-darktheme
+
 .checkbox:after
     transition: opacity 0.1s linear
     position: absolute
@@ -115,6 +122,10 @@ input[type=radio], input[type=checkbox]
     content: ''
     opacity: 0
     transform: rotate(45deg)
+
+.darktheme .checkbox:after
+    border-right-color: $main-color-darktheme
+    border-bottom-color: $main-color-darktheme
 
 
 input[type=radio]:checked + .radio:before,
@@ -142,6 +153,13 @@ input[type=radio]:focus + .radio:before,
 input[type=checkbox]:focus + .checkbox:before
     border-color: $main-color
 
+.darktheme input[type=radio]:checked + .radio:before,
+.darktheme input[type=checkbox]:checked + .checkbox:before
+    border-color: $main-color-darktheme
+
+.darktheme input[type=radio]:focus + .radio:before,
+.darktheme input[type=checkbox]:focus + .checkbox:before
+    border-color: $main-color-darktheme
 
 
 /*
@@ -151,7 +169,7 @@ input[type=checkbox]:focus + .checkbox:before
 input[type=date],
 input[type=time]
     vertical-align: top
-    font-family: 'Droid Sans', sans-serif
+    font-family: 'Open Sans', sans-serif
     font-size: 100%
     padding: 0.2em 0.3em
     box-sizing: border-box
@@ -229,8 +247,8 @@ input[type=number]
     input[type=email],
     input[type=password],
     input[type=number]
-        border: 2px solid darken($input-enabled-border-color, 75%)
-        background: darken($input-enabled-background-color, 75%)
+        border: 2px solid $input-enabled-border-color-darktheme
+        background: $input-enabled-background-color-darktheme
         color: $input-enabled-text-color-darktheme
         &:disabled
             background: darken($input-disabled-background-color, 75%)
@@ -293,6 +311,8 @@ input[type=submit]
     background: $button-enabled-background-color
     color: $button-enabled-text-color
     outline: 0 /* something on Chrome */
+    font-family: "eb garamond", serif
+    font-style: italic
     -moz-appearance: none
     -webkit-appearance: none
 
@@ -309,6 +329,11 @@ input[type=submit]
 
     &:focus
         border: 2px solid $text-color
+
+.darktheme button, .darktheme input[type=button], .darktheme input[type=submit]
+    border: 2px solid $window-color-darktheme
+    background: $button-enabled-background-color-darktheme
+    color: $button-enabled-text-color-darktheme
 
 select:-moz-focusring
     text-shadow: 0
@@ -357,6 +382,11 @@ input[type=file]:focus+.file-dropper,
 .file-dropper.active
     border-color: $main-color
 
+.darktheme input[type=file]:active+.file-dropper,
+.darktheme input[type=file]:focus+.file-dropper,
+.darktheme .file-dropper.active
+    border-color: $main-color-darktheme
+
 .autocomplete
     position: absolute
     z-index: 10
@@ -384,6 +414,7 @@ input[type=file]:focus+.file-dropper,
 
 .darktheme .autocomplete
     background: $window-color-darktheme
+    border-color: $main-color-darktheme
     ul li .disabled
         color: $inactive-link-color-darktheme
 
