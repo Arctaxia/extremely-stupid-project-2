@@ -2,7 +2,7 @@ use crate::api::error::{ApiError, ApiResult};
 use crate::app::Context;
 use crate::auth::Client;
 use argon2::password_hash::rand_core::{OsRng, RngCore};
-use diesel::sql_types::{Float, SingleValue};
+use diesel::sql_types::Float;
 use diesel::{ExpressionMethods, PgConnection, QueryDsl, QueryResult, RunQueryDsl, declare_sql_function};
 use std::ops::{Not, Range};
 use std::str::FromStr;
@@ -27,18 +27,22 @@ pub trait Builder<'a>: Sized {
     fn criteria(&mut self) -> &mut SearchCriteria<'a, Self::Token>;
 
     /// Sets OFFSET and LIMIT for search query.
-    fn set_offset_and_limit(&mut self, offset: i64, limit: i64) {
+    fn set_offset_and_limit(&mut self, offset: u64, limit: u64) {
+        let offset = i64::try_from(offset).unwrap_or(i64::MAX);
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         self.criteria().extra_args = Some(QueryArgs { offset, limit });
     }
 
     /// Executes both load and count queries for all rows matching search criteria.
-    /// If the search has a random sort, then this will also mutate the user's search seed.
-    fn list(&mut self, conn: &mut PgConnection) -> ApiResult<(i64, Vec<i64>)> {
-        if self.criteria().random_sort {
-            change_user_seed(conn, self.criteria().ctx.client)?;
+    /// If the search has a random sort and they are viewing the first page of results,
+    /// then this will also mutate the user's search seed.
+    fn list(&mut self, conn: &mut PgConnection) -> ApiResult<(u64, Vec<i64>)> {
+        let criteria = self.criteria();
+        if criteria.random_sort && criteria.extra_args.is_some_and(|args| args.offset == 0) {
+            change_user_seed(conn, criteria.ctx.client)?;
         }
 
-        let total = self.count(conn)?;
+        let total = u64::try_from(self.count(conn)?).unwrap_or(0);
         let results = self.load(conn)?;
         Ok((total, results))
     }
@@ -62,8 +66,6 @@ pub trait Builder<'a>: Sized {
 #[derive(Debug, thiserror::Error)]
 #[error(transparent)]
 pub enum TimeParsingError {
-    #[error("Dates need at least one parameter")]
-    TooFewArgs,
     #[error("Dates can have at most one parameter")]
     TooManyArgs,
     NotAnInteger(#[from] std::num::ParseIntError),
@@ -203,11 +205,7 @@ struct UnparsedFilter<'a, T> {
 impl<T> UnparsedFilter<'_, T> {
     /// Returns a version of the filter where `negated` is `false`.
     fn unnegated(self) -> Self {
-        Self {
-            kind: self.kind,
-            condition: self.condition,
-            negated: false,
-        }
+        Self { negated: false, ..self }
     }
 }
 
@@ -222,30 +220,16 @@ struct ParsedSort<T> {
 /// `has_matching` indicates if the [`temp::matching`] table has values.
 /// `has_nonmatching` indicates if the [`temp::nonmatching`] table has values.
 /// `completed` indicates if the cache for this query has been fully built.
+#[derive(Default)]
 struct CacheState {
     has_matching: bool,
     has_nonmatching: bool,
     completed: bool,
 }
 
-impl CacheState {
-    fn new() -> Self {
-        Self {
-            has_matching: false,
-            has_nonmatching: false,
-            completed: false,
-        }
-    }
-}
-
 #[declare_sql_function]
 extern "SQL" {
     fn random() -> BigInt;
-}
-
-#[declare_sql_function]
-extern "SQL" {
-    fn lower<T: SingleValue>(text: T) -> Text;
 }
 
 /// Sets the global postgresql random seed to the search seed of the `client`.
@@ -275,7 +259,7 @@ fn change_user_seed(conn: &mut PgConnection, client: Client) -> QueryResult<()> 
             .next()
             .expect("Size of u32 > size of u16");
         let random_i16 = i16::from_le_bytes(random_bytes);
-        let new_seed = f32::from(random_i16) / f32::from(i16::MAX);
+        let new_seed = f32::from(random_i16) / -f32::from(i16::MIN);
         diesel::update(user::table.find(user_id))
             .set(user::search_seed.eq(new_seed))
             .execute(conn)?;

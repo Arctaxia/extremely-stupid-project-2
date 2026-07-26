@@ -1,15 +1,15 @@
+use crate::api;
 use crate::api::doc::USER_TOKEN_TAG;
 use crate::api::error::{ApiError, ApiResult};
-use crate::api::{self, ResourceParams, UnpagedResponse};
 use crate::app::AppState;
 use crate::config::Action;
-use crate::extract::{Ctx, Json, Path, Query};
-use crate::model::enums::{AvatarStyle, ResourceType};
+use crate::extract::{Ctx, Json, Path, Query, ResourceParams, UnpagedResponse};
+use crate::model::enums::ResourceType;
 use crate::model::user::{NewUserToken, UserToken};
 use crate::resource::user::MicroUser;
 use crate::resource::user_token::{Field, UserTokenInfo};
 use crate::schema::{user, user_token};
-use crate::string::{LargeString, SmallString};
+use crate::string::{LargeString, SmallString, lower};
 use crate::time::DateTime;
 use diesel::dsl::sql;
 use diesel::sql_types::Integer;
@@ -49,29 +49,29 @@ async fn list(
     Path(username): Path<SmallString>,
     Query(params): Query<ResourceParams<Field>>,
 ) -> ApiResult<Json<UnpagedResponse<UserTokenInfo>>> {
-    let list_any = ctx.config.privileges()[Action::UserTokenListAny];
-    let list_self = ctx.config.privileges()[Action::UserTokenListSelf];
+    ctx.verify_privilege(Action::UserTokenListSelf)?;
 
-    let (avatar_style, user_tokens) = connection_pool
+    let (lowercase_name, avatar_style, user_tokens) = connection_pool
         .transaction({
+            let ctx = ctx.clone();
             let username = username.clone();
             move |conn| {
-                let (user_id, avatar_style): (i64, AvatarStyle) = user::table
-                    .select((user::id, user::avatar_style))
+                let (user_id, lowercase_name, avatar_style, target_rank): (_, SmallString, _, _) = user::table
+                    .select((user::id, lower(user::name), user::avatar_style, user::rank))
                     .filter(user::name.eq(&username))
                     .first(conn)
                     .optional()?
                     .ok_or(ApiError::NotFound(ResourceType::User))?;
-
-                let is_self = ctx.client.id == Some(user_id);
-                let required_rank = if is_self { list_self } else { list_any };
-                api::verify_privilege(ctx.client, required_rank)?;
+                if ctx.client.id != Some(user_id) {
+                    ctx.verify_privilege(Action::UserTokenListAny)?;
+                    api::verify_rank(ctx.client, target_rank)?;
+                }
 
                 user_token::table
                     .filter(user_token::user_id.eq(user_id))
                     .order(user_token::creation_time.desc())
                     .load(conn)
-                    .map(|tokens| (avatar_style, tokens))
+                    .map(|tokens| (lowercase_name, avatar_style, tokens))
                     .map_err(ApiError::from)
             }
         })
@@ -80,7 +80,11 @@ async fn list(
     let results = user_tokens
         .into_iter()
         .map(|user_token| {
-            UserTokenInfo::new(MicroUser::new(&ctx.config, username.clone(), avatar_style), user_token, params.fields)
+            UserTokenInfo::new(
+                MicroUser::new(&ctx.config, username.clone(), &lowercase_name, avatar_style),
+                user_token,
+                params.fields,
+            )
         })
         .collect();
     Ok(Json(UnpagedResponse { results }))
@@ -122,23 +126,23 @@ async fn create(
     Query(params): Query<ResourceParams<Field>>,
     Json(body): Json<UserTokenCreateBody>,
 ) -> ApiResult<Json<UserTokenInfo>> {
-    let create_any = ctx.config.privileges()[Action::UserTokenCreateAny];
-    let create_self = ctx.config.privileges()[Action::UserTokenCreateSelf];
+    ctx.verify_privilege(Action::UserTokenCreateSelf)?;
 
-    let (user_token, avatar_style) = connection_pool
+    let (user_token, lowercase_name, avatar_style) = connection_pool
         .transaction({
+            let ctx = ctx.clone();
             let username = username.clone();
             move |conn| {
-                let (user_id, avatar_style): (i64, AvatarStyle) = user::table
-                    .select((user::id, user::avatar_style))
+                let (user_id, lowercase_name, avatar_style, target_rank): (_, SmallString, _, _) = user::table
+                    .select((user::id, lower(user::name), user::avatar_style, user::rank))
                     .filter(user::name.eq(&username))
                     .first(conn)
                     .optional()?
                     .ok_or(ApiError::NotFound(ResourceType::User))?;
-
-                let is_self = ctx.client.id == Some(user_id);
-                let required_rank = if is_self { create_self } else { create_any };
-                api::verify_privilege(ctx.client, required_rank)?;
+                if ctx.client.id != Some(user_id) {
+                    ctx.verify_privilege(Action::UserTokenCreateAny)?;
+                    api::verify_rank(ctx.client, target_rank)?;
+                }
 
                 // Delete any expired or disabled tokens owned by user
                 let current_time = DateTime::now();
@@ -160,12 +164,12 @@ async fn create(
                 }
                 .insert_into(user_token::table)
                 .get_result(conn)?;
-                Ok::<_, ApiError>((user_token, avatar_style))
+                Ok::<_, ApiError>((user_token, lowercase_name, avatar_style))
             }
         })
         .await?;
     Ok(Json(UserTokenInfo::new(
-        MicroUser::new(&ctx.config, username, avatar_style),
+        MicroUser::new(&ctx.config, username, &lowercase_name, avatar_style),
         user_token,
         params.fields,
     )))
@@ -213,23 +217,23 @@ async fn update(
     Query(params): Query<ResourceParams<Field>>,
     Json(body): Json<UserTokenUpdateBody>,
 ) -> ApiResult<Json<UserTokenInfo>> {
-    let edit_any = ctx.config.privileges()[Action::UserTokenEditAny];
-    let edit_self = ctx.config.privileges()[Action::UserTokenEditSelf];
+    ctx.verify_privilege(Action::UserTokenEditSelf)?;
 
-    let (updated_user_token, avatar_style) = connection_pool
+    let (updated_user_token, lowercase_name, avatar_style) = connection_pool
         .transaction({
+            let ctx = ctx.clone();
             let username = username.clone();
             move |conn| {
-                let (user_id, avatar_style): (i64, AvatarStyle) = user::table
-                    .select((user::id, user::avatar_style))
+                let (user_id, lowercase_name, avatar_style, target_rank): (_, SmallString, _, _) = user::table
+                    .select((user::id, lower(user::name), user::avatar_style, user::rank))
                     .filter(user::name.eq(&username))
                     .first(conn)
                     .optional()?
                     .ok_or(ApiError::NotFound(ResourceType::User))?;
-
-                let is_self = ctx.client.id == Some(user_id);
-                let required_rank = if is_self { edit_self } else { edit_any };
-                api::verify_privilege(ctx.client, required_rank)?;
+                if ctx.client.id != Some(user_id) {
+                    ctx.verify_privilege(Action::UserTokenEditAny)?;
+                    api::verify_rank(ctx.client, target_rank)?;
+                }
 
                 let mut user_token: UserToken = user_token::table
                     .find(token)
@@ -251,12 +255,12 @@ async fn update(
                 user_token.last_edit_time = DateTime::now();
 
                 let updated_user_token: UserToken = user_token.save_changes(conn)?;
-                Ok::<_, ApiError>((updated_user_token, avatar_style))
+                Ok::<_, ApiError>((updated_user_token, lowercase_name, avatar_style))
             }
         })
         .await?;
     Ok(Json(UserTokenInfo::new(
-        MicroUser::new(&ctx.config, username, avatar_style),
+        MicroUser::new(&ctx.config, username, &lowercase_name, avatar_style),
         updated_user_token,
         params.fields,
     )))
@@ -280,21 +284,20 @@ async fn update(
     ),
 )]
 async fn delete(Ctx(ctx, connection_pool): Ctx, Path((username, token)): Path<(String, Uuid)>) -> ApiResult<Json<()>> {
+    ctx.verify_privilege(Action::UserTokenDeleteSelf)?;
+
     connection_pool
         .transaction(move |conn| {
-            let user_token_owner: i64 = user::table
-                .select(user::id)
+            let (user_token_owner, target_rank) = user::table
+                .select((user::id, user::rank))
                 .filter(user::name.eq(username))
                 .first(conn)
                 .optional()?
                 .ok_or(ApiError::NotFound(ResourceType::User))?;
-
-            let action = if ctx.client.id == Some(user_token_owner) {
-                Action::UserTokenDeleteSelf
-            } else {
-                Action::UserTokenDeleteAny
-            };
-            ctx.verify_privilege(action)?;
+            if ctx.client.id != Some(user_token_owner) {
+                ctx.verify_privilege(Action::UserTokenDeleteAny)?;
+                api::verify_rank(ctx.client, target_rank)?;
+            }
 
             let _: i32 = diesel::delete(
                 user_token::table
@@ -329,14 +332,14 @@ mod test {
     #[parallel]
     async fn list() -> ApiResult<()> {
         const USER: &str = "administrator";
-        verify_response(&format!("GET /user-tokens/{USER}/?{FIELDS}"), "user_token/list").await
+        verify_response(&format!("GET /user-tokens/{USER}/?{FIELDS}"), "user_token/list/typical").await
     }
 
     #[tokio::test]
     #[serial]
     async fn create() -> ApiResult<()> {
         const USER: &str = "restricted_user";
-        verify_response(&format!("POST /user-token/{USER}/?{FIELDS}"), "user_token/create").await?;
+        verify_response(&format!("POST /user-token/{USER}/?{FIELDS}"), "user_token/create/typical").await?;
 
         let mut conn = get_connection()?;
         let token: Uuid = user_token::table
@@ -344,7 +347,7 @@ mod test {
             .order(user_token::creation_time.desc())
             .first(&mut conn)?;
 
-        verify_response(&format!("DELETE /user-token/{USER}/{token}"), "user_token/delete").await?;
+        verify_response(&format!("DELETE /user-token/{USER}/{token}"), "user_token/delete/typical").await?;
 
         let has_token: bool = diesel::select(exists(user_token::table.find(token))).first(&mut conn)?;
         assert!(!has_token);
@@ -366,7 +369,7 @@ mod test {
         let mut conn = get_connection()?;
         let user_token = get_user_token(&mut conn)?;
 
-        verify_response(&format!("PUT /user-token/{USER}/{TEST_TOKEN}/?{FIELDS}"), "user_token/edit").await?;
+        verify_response(&format!("PUT /user-token/{USER}/{TEST_TOKEN}/?{FIELDS}"), "user_token/edit/typical").await?;
 
         let new_user_token = get_user_token(&mut conn)?;
         assert_eq!(new_user_token.id, user_token.id);
@@ -377,7 +380,7 @@ mod test {
         assert!(new_user_token.last_edit_time > user_token.last_edit_time);
         assert_eq!(new_user_token.last_usage_time, user_token.last_usage_time);
 
-        verify_response(&format!("PUT /user-token/{USER}/{TEST_TOKEN}/?{FIELDS}"), "user_token/edit_restore").await?;
+        verify_response(&format!("PUT /user-token/{USER}/{TEST_TOKEN}/?{FIELDS}"), "user_token/edit/restore").await?;
 
         let new_user_token = get_user_token(&mut conn)?;
         assert_eq!(new_user_token.id, user_token.id);
@@ -393,35 +396,55 @@ mod test {
     #[tokio::test]
     #[parallel]
     async fn error() -> ApiResult<()> {
-        verify_response("GET /user-tokens/fake_user", "user_token/list_nonexistent_user").await?;
-        verify_response("POST /user-token/fake_user", "user_token/create_nonexistent_user").await?;
-        verify_response(&format!("PUT /user-token/fake_user/{TEST_TOKEN}"), "user_token/edit_nonexistent_user").await?;
-        verify_response(&format!("PUT /user-token/regular_user/{TEST_TOKEN}"), "user_token/edit_nonexistent_token")
+        verify_response("GET /user-tokens/fake_user", "user_token/list/nonexistent_user").await?;
+        verify_response("POST /user-token/fake_user", "user_token/create/nonexistent_user").await?;
+        verify_response(&format!("PUT /user-token/fake_user/{TEST_TOKEN}"), "user_token/edit/nonexistent_user").await?;
+        verify_response(&format!("PUT /user-token/regular_user/{TEST_TOKEN}"), "user_token/edit/nonexistent_token")
             .await?;
-        verify_response(&format!("DELETE /user-token/fake_user/{TEST_TOKEN}"), "user_token/delete_nonexistent_user")
+        verify_response(&format!("DELETE /user-token/fake_user/{TEST_TOKEN}"), "user_token/delete/nonexistent_user")
             .await?;
-        verify_response(
-            &format!("DELETE /user-token/regular_user/{TEST_TOKEN}"),
-            "user_token/delete_nonexistent_token",
-        )
-        .await?;
+        verify_response(&format!("DELETE /user-token/regular_user/{TEST_TOKEN}"), "user_token/delete/nonexistent_token")
+            .await
+    }
 
-        // User has `self` permissions but not `any` permissions for user_token operations
-        verify_response_with_user(UserRank::Regular, "GET /user-tokens/power_user", "user_token/list_another").await?;
-        verify_response_with_user(UserRank::Regular, "POST /user-token/power_user", "user_token/create_another")
+    #[tokio::test]
+    #[parallel]
+    async fn unauthorized() -> ApiResult<()> {
+        const USER: UserRank = UserRank::Regular;
+        const SELF: &str = "regular_user";
+        const OTHER: &str = "restricted_user";
+
+        verify_response_with_user(USER, &format!("GET /user-tokens/{SELF}"), "user_token/list/own_unauthorized")
+            .await?;
+        verify_response_with_user(USER, &format!("GET /user-tokens/{OTHER}"), "user_token/list/any_unauthorized")
+            .await?;
+        verify_response_with_user(USER, &format!("POST /user-token/{SELF}"), "user_token/create/own_unauthorized")
+            .await?;
+        verify_response_with_user(USER, &format!("POST /user-token/{OTHER}"), "user_token/create/any_unauthorized")
             .await?;
         verify_response_with_user(
-            UserRank::Regular,
-            &format!("PUT /user-token/power_user/{TEST_TOKEN}"),
-            "user_token/edit_another",
+            USER,
+            &format!("PUT /user-token/{SELF}/{TEST_TOKEN}"),
+            "user_token/edit/own_unauthorized",
         )
         .await?;
         verify_response_with_user(
-            UserRank::Regular,
-            &format!("DELETE /user-token/power_user/{TEST_TOKEN}"),
-            "user_token/delete_another",
+            USER,
+            &format!("PUT /user-token/{OTHER}/{TEST_TOKEN}"),
+            "user_token/edit/any_unauthorized",
         )
         .await?;
-        Ok(())
+        verify_response_with_user(
+            USER,
+            &format!("DELETE /user-token/{SELF}/{TEST_TOKEN}"),
+            "user_token/delete/own_unauthorized",
+        )
+        .await?;
+        verify_response_with_user(
+            USER,
+            &format!("DELETE /user-token/{OTHER}/{TEST_TOKEN}"),
+            "user_token/delete/any_unauthorized",
+        )
+        .await
     }
 }

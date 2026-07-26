@@ -17,7 +17,6 @@ pub enum ErrorName {
     ConnectionAborted,
     ConnectionRefused,
     ConnectionReset,
-    ContentTypeMismatch,
     CrossesDevices,
     CryptoError,
     CyclicDependency,
@@ -27,6 +26,8 @@ pub enum ErrorName {
     DimensionLimitsExceeded,
     DimensionMismatch,
     DirectoryNotEmpty,
+    DisabledToken,
+    DownloadTooLarge,
     DuplicatePost,
     EmailAddressInvalidDomain,
     EmailAddressInvalidInput,
@@ -44,8 +45,6 @@ pub enum ErrorName {
     EmptySwf,
     EmptyValue,
     EmptyVideo,
-    EnvironmentVariableNotPresent,
-    EnvironmentVariableNotUnicode,
     ExecutableFileBusy,
     ExpiredToken,
     ExpressionFailsRegex,
@@ -84,6 +83,7 @@ pub enum ErrorName {
     InvalidInput,
     InvalidLastSymbol,
     InvalidLength,
+    InvalidMime,
     InvalidPadding,
     InvalidPassword,
     InvalidPhcStringField,
@@ -171,7 +171,6 @@ pub enum ErrorName {
     TaskCancelled,
     TaskPanicked,
     TimedOut,
-    TooFewArgs,
     TooManyArgs,
     TooManyLinks,
     UnableToSendCommand,
@@ -197,12 +196,14 @@ pub enum ErrorName {
     UnknownQueryRejectionError,
     Unsupported,
     UnsupportedAlgorithm,
+    UnsupportedContentType,
     UnsupportedColor,
     UnsupportedExtension,
     UnsupportedFeature,
     UnsupportedFormat,
     UnsupportedImageDimensions,
     UnsupportedPathType,
+    UrlValidationError,
     UserEmailAlreadyExists,
     UserNameAlreadyExists,
     UsernamePasswordMismatch,
@@ -334,6 +335,7 @@ impl ErrorKind for base64::DecodeError {
 impl ErrorKind for crate::auth::header::AuthenticationError {
     fn kind(&self) -> ErrorName {
         match self {
+            Self::DisabledToken => ErrorName::DisabledToken,
             Self::ExpiredToken => ErrorName::ExpiredToken,
             Self::FailedConnection(_) => ErrorName::FailedConnection,
             Self::FailedQuery(err) => err.kind(),
@@ -383,7 +385,6 @@ impl ErrorKind for crate::model::enums::ResourceType {
 impl ErrorKind for crate::search::TimeParsingError {
     fn kind(&self) -> ErrorName {
         match self {
-            Self::TooFewArgs => ErrorName::TooFewArgs,
             Self::TooManyArgs => ErrorName::TooManyArgs,
             Self::NotAnInteger(err) => err.kind().kind(),
             Self::OutOfRange(_) => ErrorName::OutOfRange,
@@ -525,15 +526,6 @@ impl ErrorKind for serde_json::error::Category {
     }
 }
 
-impl ErrorKind for std::env::VarError {
-    fn kind(&self) -> ErrorName {
-        match self {
-            Self::NotPresent => ErrorName::EnvironmentVariableNotPresent,
-            Self::NotUnicode(_) => ErrorName::EnvironmentVariableNotUnicode,
-        }
-    }
-}
-
 impl ErrorKind for std::io::ErrorKind {
     fn kind(&self) -> ErrorName {
         match self {
@@ -620,9 +612,9 @@ impl ErrorKind for crate::api::error::ApiError {
     fn kind(&self) -> ErrorName {
         match self {
             Self::AlreadyExists(err) => err.kind(),
-            Self::ContentTypeMismatch(..) => ErrorName::ContentTypeMismatch,
             Self::CyclicDependency(_) => ErrorName::CyclicDependency,
             Self::DeleteDefault(_) => ErrorName::DeleteDefault,
+            Self::DownloadTooLarge => ErrorName::DownloadTooLarge,
             Self::EmptySwf => ErrorName::EmptySwf,
             Self::EmptyVideo => ErrorName::EmptyVideo,
             Self::ExpressionFailsRegex(..) => ErrorName::ExpressionFailsRegex,
@@ -640,6 +632,7 @@ impl ErrorKind for crate::api::error::ApiError {
             Self::InvalidEmailAddress(err) => err.kind(),
             Self::InvalidEmail(err) => err.kind(),
             Self::InvalidHeader(_) => ErrorName::InvalidHeader,
+            Self::InvalidMime(_) => ErrorName::InvalidMime,
             Self::InvalidSort => ErrorName::InvalidSort,
             Self::InvalidTime(err) => err.kind(),
             Self::InvalidUploadToken => ErrorName::InvalidUploadToken,
@@ -669,7 +662,9 @@ impl ErrorKind for crate::api::error::ApiError {
             Self::SwfDecoding(err) => err.kind(),
             Self::TaskJoin(err) => err.kind(),
             Self::UnauthorizedPasswordReset => ErrorName::UnauthorizedPasswordReset,
+            Self::UnsupportedContentType(_) => ErrorName::UnsupportedContentType,
             Self::UnsupportedExtension(_) => ErrorName::UnsupportedExtension,
+            Self::UrlValidation(_) => ErrorName::UrlValidationError,
         }
     }
 }

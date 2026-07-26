@@ -1,15 +1,3 @@
-#![warn(clippy::pedantic)]
-// Gives warnings on derives
-#![allow(clippy::needless_for_each, clippy::large_stack_arrays, clippy::too_many_arguments)]
-// Gives warnings for integer casts in const context
-#![allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-// Option<Option<T>> is convenient for deserializing optional nullable JSON fields
-#![allow(clippy::option_option)]
-// Buggy: Fires when using assert_eq! to compare to 0.0
-#![allow(clippy::float_cmp)]
-// Too subjective
-#![allow(clippy::unreadable_literal, clippy::too_many_lines)]
-
 mod admin;
 mod api;
 mod app;
@@ -32,26 +20,33 @@ mod test;
 mod time;
 mod update;
 
-// Avoid musl's default allocator due to lackluster performance
-// https://nickb.dev/blog/default-musl-allocator-considered-harmful-to-performance
+/// Avoid musl's default allocator due to lackluster performance
+/// https://nickb.dev/blog/default-musl-allocator-considered-harmful-to-performance
 #[cfg(target_env = "musl")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[tokio::main]
 async fn main() {
-    #[cfg(feature = "load_env")]
-    app::load_env().expect("Failed to load .env");
+    let args = config::read_args();
 
-    let state = app::AppState::new(db::create_connection_pool(), config::create());
-    app::enable_tracing(&state);
+    // Enable logging
+    let config = config::create(args);
+    app::enable_tracing(&config);
 
-    if let Err(err) = app::initialize(&state) {
-        tracing::error!("An error occurred during initialization. Details:\n{err}");
-        std::process::exit(1);
-    }
-    if let Err(err) = app::run(state).await {
-        tracing::error!("Unable to start server. Details:\n{err}");
-        std::process::exit(1);
-    }
+    // Read environment
+    let env = config::read_env(&config).unwrap_or_else(|err| app::shutdown("Failed to read environment", err));
+
+    // Create global app state
+    let downloader = content::download::create_client()
+        .unwrap_or_else(|err| app::shutdown("Failed to create downloader client", err));
+    let connection_pool = db::create_connection_pool(&env, config.clone())
+        .unwrap_or_else(|err| app::shutdown("Failed to build connection pool", err));
+    let state = app::AppState::new(downloader, connection_pool, env, config);
+
+    // Initialize and run server
+    app::initialize(&state).unwrap_or_else(|err| app::shutdown("An error occurred during initialization", err));
+    app::run(state)
+        .await
+        .unwrap_or_else(|err| app::shutdown("Failed to start server", err));
 }

@@ -1,9 +1,8 @@
 use crate::api::doc::SNAPSHOT_TAG;
 use crate::api::error::{ApiError, ApiResult};
-use crate::api::{PageParams, PagedResponse, ResourceParams};
 use crate::app::AppState;
 use crate::config::Action;
-use crate::extract::{Ctx, Json, Query};
+use crate::extract::{Ctx, Json, PageParams, PagedResponse, Query, ResourceParams};
 use crate::resource::snapshot::{Field, SnapshotInfo};
 use crate::search::Builder;
 use crate::search::snapshot::QueryBuilder;
@@ -13,8 +12,6 @@ use utoipa_axum::routes;
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new().routes(routes!(list))
 }
-
-const MAX_SNAPSHOTS_PER_PAGE: i64 = 1000;
 
 /// Lists recent resource snapshots.
 ///
@@ -57,7 +54,7 @@ async fn list(
     ctx.verify_privilege(Action::SnapshotList)?;
 
     let offset = page.offset.unwrap_or(0);
-    let limit = std::cmp::min(page.limit.get(), MAX_SNAPSHOTS_PER_PAGE);
+    let limit = page.limit();
     connection_pool
         .transaction(move |conn| {
             let mut query_builder = QueryBuilder::new(&ctx, resource.criteria())?;
@@ -73,4 +70,19 @@ async fn list(
             }))
         })
         .await
+}
+
+#[cfg(test)]
+mod test {
+    use crate::api::error::ApiResult;
+    use crate::model::enums::UserRank;
+    use crate::test::*;
+    use serial_test::parallel;
+
+    #[tokio::test]
+    #[parallel]
+    async fn unauthorized() -> ApiResult<()> {
+        const USER: UserRank = UserRank::Regular;
+        verify_response_with_user(USER, "GET /snapshots?limit=1", "snapshot/list_unauthorized").await
+    }
 }

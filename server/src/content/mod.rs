@@ -1,10 +1,11 @@
 use crate::api::error::{ApiError, ApiResult};
-use crate::config::Config;
 use crate::content::cache::CachedProperties;
 use crate::content::thumbnail::ThumbnailType;
 use crate::content::upload::UploadToken;
 use crate::extract::Ctx;
 use image::DynamicImage;
+use mime::Mime;
+use reqwest::header::{CONTENT_TYPE, HeaderMap, ToStrError};
 use url::Url;
 
 pub mod cache;
@@ -29,8 +30,8 @@ pub enum Content {
 }
 
 impl Content {
-    /// Constructs a new [`Content`] from either an in-memory `direct_upload`, a `token` which represents
-    /// a file in the temporary uploads directory, or a URL to download the content from.
+    /// Constructs a new [`Content`] from either a `token` which represents a file in the
+    /// temporary uploads directory or a URL to download the content from.
     ///
     /// If multiple ways of retrieving content are given, the method of retrieving the content will
     /// be the first argument that is not [`None`].
@@ -43,36 +44,43 @@ impl Content {
     }
 
     /// Saves content to temporary uploads directory and returns the name of the file written.
-    pub async fn save(self, config: &Config) -> ApiResult<UploadToken> {
+    pub async fn save(self, ctx: &Ctx) -> ApiResult<UploadToken> {
         match self {
             Self::Token(token) => Ok(token),
-            Self::Url(url) => download::from_url(config, url).await,
+            Self::Url(url) => download::from_url(ctx, url).await,
         }
     }
 
     /// Computes thumbnail for uploaded content.
-    pub async fn thumbnail(self, config: &Config, thumbnail_type: ThumbnailType) -> ApiResult<DynamicImage> {
-        let token = self.save(config).await?;
-        let temp_path = token.path(config);
-        tokio::task::block_in_place({
-            || {
-                decode::representative_image(config, &temp_path, token.mime_type())
-                    .map(|image| thumbnail::create(config, &image, thumbnail_type))
-            }
+    pub async fn thumbnail(self, ctx: Ctx, thumbnail_type: ThumbnailType) -> ApiResult<DynamicImage> {
+        let token = self.save(&ctx).await?;
+        let temp_path = token.path(&ctx.config);
+        tokio::task::spawn_blocking(move || {
+            decode::representative_image(&ctx.config, &temp_path, token.mime_type())
+                .map(|image| thumbnail::create(&ctx.config, image, thumbnail_type))
         })
+        .await?
     }
 
     /// Computes properties for uploaded content.
-    pub async fn compute_properties(self, ctx: &Ctx) -> ApiResult<CachedProperties> {
-        let token = self.save(&ctx.config).await?;
-        tokio::task::block_in_place(|| cache::compute_properties(ctx, token))
+    pub async fn compute_properties(self, ctx: Ctx) -> ApiResult<CachedProperties> {
+        let token = self.save(&ctx).await?;
+        tokio::task::spawn_blocking(move || cache::compute_properties(&ctx, token)).await?
     }
 
     /// Retrieves content properties from cache or computes them if not present in cache.
-    pub async fn get_or_compute_properties(self, ctx: &Ctx) -> ApiResult<CachedProperties> {
-        let token = self.save(&ctx.config).await?;
-        tokio::task::block_in_place(|| cache::get_or_compute_properties(ctx, token))
+    pub async fn remove_or_compute_properties(self, ctx: Ctx) -> ApiResult<CachedProperties> {
+        let token = self.save(&ctx).await?;
+        tokio::task::spawn_blocking(move || cache::remove_or_compute_properties(&ctx, token)).await?
     }
+}
+
+pub fn parse_header(headers: &HeaderMap) -> Result<Option<Mime>, ToStrError> {
+    headers
+        .get(CONTENT_TYPE)
+        .map(|header_value| header_value.to_str())
+        .transpose()
+        .map(|header| header.and_then(|value| value.parse().ok()))
 }
 
 fn map_read_result<T>(result: std::io::Result<T>) -> ApiResult<T> {

@@ -29,7 +29,7 @@ pub struct CachedProperties {
 
 /// A simple ring buffer that stores [`CachedProperties`].
 pub struct RingCache {
-    data: VecDeque<(UploadToken, CachedProperties)>,
+    data: VecDeque<CachedProperties>,
     max_size: usize,
 }
 
@@ -41,12 +41,8 @@ impl RingCache {
         }
     }
 
-    pub fn clear(&mut self) {
-        self.data = VecDeque::new();
-    }
-
-    fn insert(&mut self, key: UploadToken, value: CachedProperties) {
-        self.data.push_back((key, value));
+    fn insert(&mut self, value: CachedProperties) {
+        self.data.push_back(value);
         if self.data.len() > self.max_size {
             self.data.pop_front();
         }
@@ -55,25 +51,23 @@ impl RingCache {
     fn remove(&mut self, key: &UploadToken) -> Option<CachedProperties> {
         self.data
             .iter()
-            .position(|(cache_key, _)| cache_key == key)
+            .position(|value| &value.token == key)
             .and_then(|pos| self.data.remove(pos))
-            .map(|(_, cache_value)| cache_value)
     }
 }
 
 /// Computes content properties and caches them in memory.
 pub fn compute_properties(ctx: &Ctx, content_token: UploadToken) -> ApiResult<CachedProperties> {
-    let properties = compute_properties_no_cache(ctx, content_token.clone())?;
+    let properties = compute_properties_no_cache(ctx, content_token)?;
 
-    // Clone this here to make sure we aren't holding onto lock for longer than necessary
     let properties_copy = properties.clone();
-    ctx.get_content_cache().insert(content_token, properties_copy);
+    ctx.get_content_cache().insert(properties);
 
-    Ok(properties)
+    Ok(properties_copy)
 }
 
 /// Returns cached properties of content or computes them if not in cache.
-pub fn get_or_compute_properties(ctx: &Ctx, content_token: UploadToken) -> ApiResult<CachedProperties> {
+pub fn remove_or_compute_properties(ctx: &Ctx, content_token: UploadToken) -> ApiResult<CachedProperties> {
     let maybe_properties = ctx.get_content_cache().remove(&content_token);
     match maybe_properties {
         Some(properties) => Ok(properties),
@@ -88,28 +82,29 @@ fn compute_properties_no_cache(ctx: &Ctx, token: UploadToken) -> ApiResult<Cache
     let (checksum, md5_checksum) = content::map_read_result(hash::compute_checksums(&temp_path))?;
 
     let mime_type = token.mime_type();
-    let post_type = decode::detect_post_type(&temp_path, mime_type)?;
+    let post_type = decode::detect_post_type(&ctx.config, &temp_path, mime_type)?;
     let has_sound = match post_type {
         PostType::Image | PostType::Animation => false,
-        PostType::Video => decode::video_has_audio(&temp_path)?,
+        PostType::Video => decode::video_has_audio(&ctx.config, &temp_path)?,
         PostType::Flash => decode::swf_has_audio(&temp_path)?,
     };
     let flags = if has_sound {
-        PostFlags::new_with(PostFlag::Sound)
+        PostFlags::one(PostFlag::Sound)
     } else {
-        PostFlags::new()
+        PostFlags::none()
     };
 
     let image = decode::representative_image(&ctx.config, &temp_path, mime_type)?;
-
+    let width = i32::try_from(image.width()).map_err(|_| LimitErrorKind::DimensionError)?;
+    let height = i32::try_from(image.height()).map_err(|_| LimitErrorKind::DimensionError)?;
     Ok(CachedProperties {
         token,
         checksum,
         md5_checksum,
         signature: signature::compute(&image),
-        thumbnail: thumbnail::create(&ctx.config, &image, ThumbnailType::Post),
-        width: i32::try_from(image.width()).map_err(|_| LimitErrorKind::DimensionError)?,
-        height: i32::try_from(image.height()).map_err(|_| LimitErrorKind::DimensionError)?,
+        thumbnail: thumbnail::create(&ctx.config, image, ThumbnailType::Post),
+        width,
+        height,
         mime_type,
         post_type,
         file_size,

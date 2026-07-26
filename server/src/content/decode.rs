@@ -2,15 +2,19 @@ use crate::api::error::{ApiError, ApiResult};
 use crate::config::Config;
 use crate::content::{self, flash};
 use crate::model::enums::{MimeType, PostType};
+use ffmpeg_sidecar::child::FfmpegChild;
 use ffmpeg_sidecar::command::FfmpegCommand;
 use ffmpeg_sidecar::event::{FfmpegEvent, LogLevel};
+use ffmpeg_sidecar::iter::FfmpegIterator;
 use image::codecs::{gif::GifDecoder, webp::WebPDecoder};
 use image::{AnimationDecoder, DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits, RgbImage, RgbaImage};
+use std::borrow::Cow;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
+use std::str::FromStr;
 use swf::Tag;
-use tracing::error;
+use tracing::{error, warn};
 
 /// Returns a representative image for the given content.
 /// For images, this is simply the decoded image.
@@ -24,36 +28,31 @@ pub fn representative_image(config: &Config, file_path: &Path, mime_type: MimeTy
         MimeType::Png => image(file_path, ImageFormat::Png),
         MimeType::Webp => image(file_path, ImageFormat::WebP),
         MimeType::Swf => flash_image(config, file_path).and_then(|frame| frame.ok_or(ApiError::EmptySwf)),
-        MimeType::Avif => ffmpeg_frame(file_path, PostType::Image)
+        MimeType::Avif => ffmpeg_frame(config, file_path, PostType::Image)
             .and_then(|frame| frame.ok_or(ApiError::FfmpegError("Unable to decode AVIF image with FFmpeg".into()))),
         MimeType::Mov | MimeType::Mp4 | MimeType::Webm => {
-            ffmpeg_frame(file_path, PostType::Video).and_then(|frame| frame.ok_or(ApiError::EmptyVideo))
+            ffmpeg_frame(config, file_path, PostType::Video).and_then(|frame| frame.ok_or(ApiError::EmptyVideo))
         }
     }
 }
 
 /// Returns if the video at `path` has an audio channel.
-pub fn video_has_audio(path: &Path) -> ApiResult<bool> {
-    let path_str = path.to_string_lossy();
-    let iter = FfmpegCommand::new_with_path(FFMPEG_PATH)
-        .input(path_str)
-        .args(["-c", "copy", "-t", "0", "-f", "null", "-"])
-        .spawn()?
-        .iter()
-        .map_err(|err| ApiError::FfmpegError(err.into_boxed_dyn_error()))?;
+pub fn video_has_audio(config: &Config, path: &Path) -> ApiResult<bool> {
+    let mut process = FfmpegSubprocess::new(config, path, ["-c", "copy", "-t", "0", "-f", "null", "-"])?;
 
-    for event in iter {
+    let mut errors = Vec::new();
+    for event in process.events()? {
         match event {
-            FfmpegEvent::ParsedInputStream(stream) if stream.is_audio() => {
-                return Ok(true);
-            }
-            FfmpegEvent::Log(LogLevel::Error | LogLevel::Fatal, err) | FfmpegEvent::Error(err) => {
-                return Err(ApiError::FfmpegError(err.into()));
-            }
+            FfmpegEvent::ParsedInputStream(stream) if stream.is_audio() => return Ok(true),
+            FfmpegEvent::Log(LogLevel::Error | LogLevel::Fatal, err) | FfmpegEvent::Error(err) => errors.push(err),
             _ => {}
         }
     }
-    Ok(false)
+    if errors.is_empty() {
+        Ok(false)
+    } else {
+        Err(ApiError::FfmpegError(errors.join(ERROR_SEPARATOR).into()))
+    }
 }
 
 /// Returns if the swf at `path` has audio.
@@ -80,11 +79,11 @@ pub fn swf_has_audio(path: &Path) -> ApiResult<bool> {
 /// Returns the post type based on file content.
 /// For image formats that support animation, it checks the file content for multiple frames.
 /// For everything else, it just checks the mime type.
-pub fn detect_post_type(file_path: &Path, mime_type: MimeType) -> ApiResult<PostType> {
+pub fn detect_post_type(config: &Config, file_path: &Path, mime_type: MimeType) -> ApiResult<PostType> {
     // Shorthand to return PostType::Animation or PostType::Image based on bool input
     let image_type = |animated: bool| -> PostType { if animated { PostType::Animation } else { PostType::Image } };
     match mime_type {
-        MimeType::Avif => avif_is_animated(file_path).map(image_type),
+        MimeType::Avif => avif_is_animated(config, file_path).map(image_type),
         MimeType::Gif => gif_is_animated(file_path).map(image_type),
         MimeType::Webp => webp_is_animated(file_path).map(image_type),
         MimeType::Bmp | MimeType::Jpeg | MimeType::Png => Ok(PostType::Image),
@@ -93,7 +92,48 @@ pub fn detect_post_type(file_path: &Path, mime_type: MimeType) -> ApiResult<Post
     }
 }
 
-const FFMPEG_PATH: &str = "/opt/app/ffmpeg";
+pub fn infer_mime_type(prefix: &[u8]) -> ApiResult<MimeType> {
+    let kind = infer::get(prefix).ok_or(ApiError::MissingContentType)?;
+    let mime_type = kind.mime_type();
+    MimeType::from_str(mime_type).map_err(|_| ApiError::UnsupportedContentType(Cow::Borrowed(mime_type)))
+}
+
+const DEFAULT_FFMPEG_PATH: &str = "/opt/app/ffmpeg";
+const ERROR_SEPARATOR: &str = "; ";
+
+/// RAII guard that kills the `FFmpeg` subprocess when dropped.
+struct FfmpegSubprocess(FfmpegChild);
+
+impl FfmpegSubprocess {
+    fn new<const N: usize>(config: &Config, input: &Path, args: [&str; N]) -> std::io::Result<Self> {
+        let ffmpeg_path = config
+            .args
+            .ffmpeg_path
+            .as_deref()
+            .unwrap_or(Path::new(DEFAULT_FFMPEG_PATH));
+        // Lossy conversion is fine here since filenames are ASCII upload tokens
+        let input_str = input.to_string_lossy();
+        FfmpegCommand::new_with_path(ffmpeg_path)
+            .input(&input_str)
+            .args(args)
+            .spawn()
+            .map(Self)
+    }
+
+    fn events(&mut self) -> ApiResult<FfmpegIterator> {
+        self.0
+            .iter()
+            .map_err(|err| ApiError::FfmpegError(err.into_boxed_dyn_error()))
+    }
+}
+
+impl Drop for FfmpegSubprocess {
+    fn drop(&mut self) {
+        // Ignore errors as the process may have already exited
+        self.0.kill().ok();
+        self.0.wait().ok();
+    }
+}
 
 /// Decodes a raw array of bytes into pixel data.
 fn image(file_path: &Path, format: ImageFormat) -> ApiResult<DynamicImage> {
@@ -106,7 +146,7 @@ fn image(file_path: &Path, format: ImageFormat) -> ApiResult<DynamicImage> {
 }
 
 /// Decodes a representative frame of the image or video at the given `path`.
-fn ffmpeg_frame(path: &Path, post_type: PostType) -> ApiResult<Option<DynamicImage>> {
+fn ffmpeg_frame(config: &Config, path: &Path, post_type: PostType) -> ApiResult<Option<DynamicImage>> {
     let is_video_format = matches!(post_type, PostType::Video | PostType::Flash);
     let filter = if is_video_format {
         "thumbnail,format=rgb24"
@@ -114,15 +154,10 @@ fn ffmpeg_frame(path: &Path, post_type: PostType) -> ApiResult<Option<DynamicIma
         "format=rgba"
     };
 
-    let path_str = path.to_string_lossy();
-    let iter = FfmpegCommand::new_with_path(FFMPEG_PATH)
-        .input(&path_str)
-        .args(["-vf", filter, "-frames:v", "1", "-f", "rawvideo", "-"])
-        .spawn()?
-        .iter()
-        .map_err(|err| ApiError::FfmpegError(err.into_boxed_dyn_error()))?;
+    let mut process = FfmpegSubprocess::new(config, path, ["-vf", filter, "-frames:v", "1", "-f", "rawvideo", "-"])?;
 
-    for event in iter {
+    let mut errors = Vec::new();
+    for event in process.events()? {
         match event {
             FfmpegEvent::OutputFrame(f) => {
                 let buffer_len = f.data.len();
@@ -134,22 +169,32 @@ fn ffmpeg_frame(path: &Path, post_type: PostType) -> ApiResult<Option<DynamicIma
                 .ok_or(ApiError::FrameBufferMismatch(f.width, f.height, buffer_len))?;
                 return Ok(Some(extracted_frame));
             }
-            FfmpegEvent::Log(LogLevel::Error | LogLevel::Fatal, err) | FfmpegEvent::Error(err) => {
-                return Err(ApiError::FfmpegError(err.into()));
-            }
+            FfmpegEvent::Log(LogLevel::Error | LogLevel::Fatal, err) | FfmpegEvent::Error(err) => errors.push(err),
             _ => {}
         }
     }
-    Ok(None)
+    if errors.is_empty() {
+        Ok(None)
+    } else {
+        Err(ApiError::FfmpegError(errors.join(ERROR_SEPARATOR).into()))
+    }
 }
 
-/// Search swf tags for the largest decodable image
+/// Decodes a representative frame of the flash file at the given `path`.
 fn flash_image(config: &Config, path: &Path) -> ApiResult<Option<DynamicImage>> {
+    // First try feeding to FFmpeg for a representative frame
+    match ffmpeg_frame(config, path, PostType::Flash) {
+        Ok(Some(frame)) => return Ok(Some(frame)),
+        Ok(None) => warn!("FFmpeg gave no image output for flash file, falling back to parsing flash tags..."),
+        Err(err) => error!("Failed to extract thumbnail with FFmpeg: {err}"),
+    }
+
     let file = File::open(path)?;
     let reader = BufReader::new(file);
     let swf_buf = swf::decompress_swf(reader)?;
     let swf = swf::parse_swf(&swf_buf)?;
 
+    // If FFmpeg fails to output an image, manually search flash tags for a decodable image
     let encoding_table = swf
         .tags
         .iter()
@@ -161,7 +206,7 @@ fn flash_image(config: &Config, path: &Path) -> ApiResult<Option<DynamicImage>> 
             }
         })
         .copied();
-    let mut images: Vec<_> = swf
+    let image_iter = swf
         .tags
         .iter()
         .filter_map(|tag| match tag {
@@ -177,67 +222,77 @@ fn flash_image(config: &Config, path: &Path) -> ApiResult<Option<DynamicImage>> 
         .filter_map(|image_result| match image_result {
             Ok(image) => Some(image),
             Err(err) => {
-                error!("Failure to decode flash image for reason: {err}");
+                error!("Failure to decode flash image: {err}");
                 None
             }
-        })
-        .collect();
+        });
 
-    // Some Flash files only have video frames, which are hard to decode.
-    // So, we feed to ffmpeg and see if it can decode a representaive frame.
-    if let Ok(Some(frame)) = ffmpeg_frame(path, PostType::Flash) {
-        images.push(frame);
-    }
-
-    // Sort images in order of decreasing effective width after cropping for thumbnails
-    images.sort_by_key(|image| {
-        let (thumbnail_width, thumbnail_height) = config.thumbnails.post_dimensions();
+    // Find image with largest effective width after cropping for thumbnails
+    Ok(image_iter.max_by_key(|image| {
+        // Convert values to `u64` to avoid overflow.
+        let thumbnail_width = u64::from(config.thumbnails.post_width);
+        let thumbnail_height = u64::from(config.thumbnails.post_height);
+        let image_width = u64::from(image.width());
+        let image_height = u64::from(image.height());
 
         // Condition is equivalent to image_aspect_ratio > config_thumbnail_aspect_ratio
-        let effective_width = if image.width() * thumbnail_height > thumbnail_width * image.height() {
-            image.height() * thumbnail_width / thumbnail_height
+        if image_width * thumbnail_height > thumbnail_width * image_height {
+            image_height * thumbnail_width / thumbnail_height
         } else {
-            image.width()
-        };
-        u32::MAX - effective_width
-    });
-    Ok(images.into_iter().next())
+            image_width
+        }
+    }))
+}
+
+/// Returns the number of video streams in the file at `path`.
+fn video_stream_count(config: &Config, path: &Path) -> ApiResult<usize> {
+    let mut process = FfmpegSubprocess::new(config, path, ["-c", "copy", "-t", "0", "-f", "null", "-"])?;
+
+    let mut stream_count = 0;
+    let mut errors = Vec::new();
+    for event in process.events()? {
+        match event {
+            FfmpegEvent::ParsedInputStream(stream) if stream.is_video() => stream_count += 1,
+            FfmpegEvent::Log(LogLevel::Error | LogLevel::Fatal, err) | FfmpegEvent::Error(err) => errors.push(err),
+            _ => {}
+        }
+    }
+    if stream_count > 1 || errors.is_empty() {
+        Ok(stream_count)
+    } else {
+        Err(ApiError::FfmpegError(errors.join(ERROR_SEPARATOR).into()))
+    }
 }
 
 /// Uses `FFmpeg` to determine if a file contains multiple frames
-fn avif_is_animated(path: &Path) -> ApiResult<bool> {
-    let path_str = path.to_string_lossy();
-    let video_stream_count = FfmpegCommand::new_with_path(FFMPEG_PATH)
-        .input(&path_str)
-        .spawn()?
-        .iter()
-        .map_err(|err| ApiError::FfmpegError(err.into_boxed_dyn_error()))?
-        .filter(|event| matches!(event, FfmpegEvent::ParsedInputStream(stream) if stream.is_video()))
-        .count();
+fn avif_is_animated(config: &Config, path: &Path) -> ApiResult<bool> {
+    let video_stream_count = video_stream_count(config, path)?;
 
+    let mut errors = Vec::new();
     for stream_index in 0..video_stream_count {
-        let iter = FfmpegCommand::new_with_path(FFMPEG_PATH)
-            .input(&path_str)
-            .args([
+        let mut process = FfmpegSubprocess::new(
+            config,
+            path,
+            [
                 "-map",
                 &format!("0:v:{stream_index}"),
                 "-frames:v",
                 "2",
                 "-vf",
                 "scale=1:1:flags=neighbor",
-            ])
-            .rawvideo()
-            .spawn()?
-            .iter()
-            .map_err(|err| ApiError::FfmpegError(err.into_boxed_dyn_error()))?;
+                "-pix_fmt",
+                "rgb24",
+                "-f",
+                "rawvideo",
+                "-",
+            ],
+        )?;
 
         let mut frames = 0;
-        for event in iter {
+        for event in process.events()? {
             match event {
                 FfmpegEvent::OutputFrame(_) => frames += 1,
-                FfmpegEvent::Log(LogLevel::Error | LogLevel::Fatal, err) | FfmpegEvent::Error(err) => {
-                    return Err(ApiError::FfmpegError(err.into()));
-                }
+                FfmpegEvent::Log(LogLevel::Error | LogLevel::Fatal, err) | FfmpegEvent::Error(err) => errors.push(err),
                 _ => {}
             }
         }
@@ -245,7 +300,11 @@ fn avif_is_animated(path: &Path) -> ApiResult<bool> {
             return Ok(true);
         }
     }
-    Ok(false)
+    if errors.is_empty() {
+        Ok(false)
+    } else {
+        Err(ApiError::FfmpegError(errors.join(ERROR_SEPARATOR).into()))
+    }
 }
 
 fn gif_is_animated(path: &Path) -> ApiResult<bool> {
@@ -271,9 +330,11 @@ fn webp_is_animated(path: &Path) -> ApiResult<bool> {
 
 /// Returns maximum decoded image size.
 fn image_reader_limits() -> Limits {
-    const GB: u64 = 1024_u64.pow(3);
+    const MB: u64 = 1024_u64.pow(2);
 
     let mut limits = Limits::no_limits();
-    limits.max_alloc = Some(4 * GB);
+    limits.max_alloc = Some(256 * MB);
+    limits.max_image_width = Some(16384);
+    limits.max_image_height = Some(16384);
     limits
 }

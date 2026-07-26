@@ -1,10 +1,9 @@
 use crate::api::doc::TAG_TAG;
 use crate::api::error::{ApiError, ApiResult};
-use crate::api::{DeleteBody, MergeBody, PageParams, PagedResponse, ResourceParams};
 use crate::app::{AppState, Context};
 use crate::config::Action;
-use crate::extract::{Ctx, Json, Path, Query};
-use crate::model::enums::{ResourceType, UserRank};
+use crate::extract::{Ctx, DeleteBody, Json, MergeBody, PageParams, PagedResponse, Path, Query, ResourceParams};
+use crate::model::enums::ResourceType;
 use crate::model::tag::{NewTag, Tag};
 use crate::resource::tag::{Field, TagInfo};
 use crate::schema::{post_tag, tag, tag_category, tag_name};
@@ -16,10 +15,7 @@ use crate::time::DateTime;
 use crate::update::tag::FetchMode;
 use crate::{api, snapshot, update};
 use diesel::dsl::count_star;
-use diesel::{
-    ExpressionMethods, Insertable, OptionalExtension, PgConnection, QueryDsl, RunQueryDsl, SaveChangesDsl,
-    SelectableHelper,
-};
+use diesel::{ExpressionMethods, Insertable, OptionalExtension, PgConnection, QueryDsl, RunQueryDsl, SaveChangesDsl};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
@@ -33,8 +29,33 @@ pub fn routes() -> OpenApiRouter<AppState> {
         .routes(routes!(merge))
 }
 
-const MAX_TAGS_PER_PAGE: i64 = 1000;
 const MAX_TAG_SIBLINGS: i64 = 50;
+
+fn verify_visibility(conn: &mut PgConnection, ctx: &Context, tag_name: &str) -> ApiResult<i64> {
+    if ctx.preferences().is_empty() {
+        tag_name::table
+            .select(tag_name::tag_id)
+            .filter(tag_name::name.eq(tag_name))
+            .first(conn)
+            .optional()?
+            .ok_or(ApiError::NotFound(ResourceType::Tag))
+    } else {
+        let (tag_id, category_name): (_, SmallString) = tag::table
+            .inner_join(tag_name::table)
+            .inner_join(tag_category::table)
+            .select((tag::id, tag_category::name))
+            .filter(tag_name::name.eq(tag_name))
+            .first(conn)
+            .optional()?
+            .ok_or(ApiError::NotFound(ResourceType::Tag))?;
+
+        if ctx.preferences().tag_hidden(conn, tag_name, &category_name)? {
+            Err(ApiError::Hidden(ResourceType::Tag))
+        } else {
+            Ok(tag_id)
+        }
+    }
+}
 
 /// Searches for tags.
 ///
@@ -89,10 +110,11 @@ async fn list(
     Query(resource): Query<ResourceParams<Field>>,
     Query(page): Query<PageParams>,
 ) -> ApiResult<Json<PagedResponse<TagInfo>>> {
+    ctx.verify_privilege(Action::TagView)?;
     ctx.verify_privilege(Action::TagList)?;
 
     let offset = page.offset.unwrap_or(0);
-    let limit = std::cmp::min(page.limit.get(), MAX_TAGS_PER_PAGE);
+    let limit = page.limit();
     connection_pool
         .transaction(move |conn| {
             let mut query_builder = QueryBuilder::new(&ctx, resource.criteria())?;
@@ -186,6 +208,7 @@ async fn get_siblings(
     Query(params): Query<ResourceParams<Field>>,
 ) -> ApiResult<Json<TagSiblings>> {
     ctx.verify_privilege(Action::TagView)?;
+    ctx.verify_privilege(Action::TagList)?;
 
     connection_pool
         .transaction(move |conn| {
@@ -203,18 +226,11 @@ async fn get_siblings(
                 .limit(MAX_TAG_SIBLINGS)
                 .into_boxed();
 
-            if ctx.client.rank == UserRank::Anonymous {
-                let preferences = &ctx.config.anonymous_preferences;
-                let hidden_tags = tag::table
-                    .select(tag::id)
-                    .inner_join(tag_category::table)
-                    .inner_join(tag_name::table)
-                    .filter(tag_name::name.eq_any(&preferences.tag_blacklist))
-                    .or_filter(tag_category::name.eq_any(&preferences.tag_category_blacklist));
+            if let Some(hidden_tags) = ctx.preferences().hidden_tags() {
                 sibling_query = sibling_query.filter(post_tag::tag_id.ne_all(hidden_tags));
             }
 
-            let (sibling_ids, common_post_counts): (Vec<i64>, Vec<i64>) =
+            let (sibling_ids, common_post_counts): (Vec<_>, Vec<_>) =
                 sibling_query.load::<(i64, i64)>(conn)?.into_iter().unzip();
 
             let results = TagInfo::new_batch_from_ids(conn, &sibling_ids, params.fields)?
@@ -280,7 +296,7 @@ async fn create(
 
     let tag = connection_pool
         .transaction(move |conn| {
-            let (category_id, category): (i64, SmallString) = tag_category::table
+            let (category_id, category) = tag_category::table
                 .select((tag_category::id, tag_category::name))
                 .filter(tag_category::name.eq(body.category))
                 .first(conn)
@@ -295,18 +311,10 @@ async fn create(
 
             // Add names, implications, and suggestions
             update::tag::set_names(conn, &ctx.config, tag.id, &body.names)?;
-            let (implied_ids, implications) = update::tag::get_or_create_tag_ids(
-                conn,
-                &ctx,
-                body.implications.unwrap_or_default(),
-                FetchMode::Acyclic,
-            )?;
-            let (suggested_ids, suggestions) = update::tag::get_or_create_tag_ids(
-                conn,
-                &ctx,
-                body.suggestions.unwrap_or_default(),
-                FetchMode::Acyclic,
-            )?;
+            let (implied_ids, implications) =
+                update::tag::get_or_create_tags(conn, &ctx, body.implications.unwrap_or_default(), FetchMode::Acyclic)?;
+            let (suggested_ids, suggestions) =
+                update::tag::get_or_create_tags(conn, &ctx, body.suggestions.unwrap_or_default(), FetchMode::Acyclic)?;
             update::tag::set_implications(conn, tag.id, &implied_ids)?;
             update::tag::set_suggestions(conn, tag.id, &suggested_ids)?;
 
@@ -351,31 +359,36 @@ async fn merge(
     Query(params): Query<ResourceParams<Field>>,
     Json(body): Json<MergeBody<SmallString>>,
 ) -> ApiResult<Json<TagInfo>> {
+    ctx.verify_privilege(Action::TagView)?;
     ctx.verify_privilege(Action::TagMerge)?;
 
-    let get_tag_info = |conn: &mut PgConnection, name: &str| {
+    let get_tag_info = |conn: &mut PgConnection, ctx: &Context, name: &str| {
+        let tag_id = verify_visibility(conn, ctx, name)?;
         tag::table
-            .select((tag::id, tag::last_edit_time))
-            .inner_join(tag_name::table)
-            .filter(tag_name::name.eq(name))
+            .find(tag_id)
+            .select(tag::last_edit_time)
             .first(conn)
             .optional()?
             .ok_or(ApiError::NotFound(ResourceType::Tag))
+            .map(|last_edit_time| (tag_id, last_edit_time))
     };
 
     let merged_tag_id = connection_pool
-        .transaction(move |conn| {
-            let (absorbed_id, absorbed_version) = get_tag_info(conn, &body.remove)?;
-            let (merge_to_id, merge_to_version) = get_tag_info(conn, &body.merge_to)?;
-            if absorbed_id == merge_to_id {
-                return Err(ApiError::SelfMerge(ResourceType::Tag));
-            }
-            api::verify_version(absorbed_version, body.remove_version)?;
-            api::verify_version(merge_to_version, body.merge_to_version)?;
+        .transaction({
+            let ctx = ctx.clone();
+            move |conn| {
+                let (absorbed_id, absorbed_version) = get_tag_info(conn, &ctx, &body.remove)?;
+                let (merge_to_id, merge_to_version) = get_tag_info(conn, &ctx, &body.merge_to)?;
+                if absorbed_id == merge_to_id {
+                    return Err(ApiError::SelfMerge(ResourceType::Tag));
+                }
+                api::verify_version(absorbed_version, body.remove_version)?;
+                api::verify_version(merge_to_version, body.merge_to_version)?;
 
-            update::tag::merge(conn, absorbed_id, merge_to_id)?;
-            snapshot::tag::merge_snapshot(conn, ctx.client, body.remove, &body.merge_to)?;
-            Ok::<_, ApiError>(merge_to_id)
+                update::tag::merge(conn, absorbed_id, merge_to_id)?;
+                snapshot::tag::merge_snapshot(conn, ctx.client, body.remove, &body.merge_to)?;
+                Ok::<_, ApiError>(merge_to_id)
+            }
         })
         .await?;
     connection_pool
@@ -436,69 +449,72 @@ async fn update(
     Query(params): Query<ResourceParams<Field>>,
     Json(body): Json<TagUpdateBody>,
 ) -> ApiResult<Json<TagInfo>> {
+    ctx.verify_privilege(Action::TagView)?;
+
     let tag_id = connection_pool
-        .transaction(move |conn| {
-            let old_tag: Tag = tag::table
-                .inner_join(tag_name::table)
-                .select(Tag::as_select())
-                .filter(tag_name::name.eq(name))
-                .first(conn)
-                .optional()?
-                .ok_or(ApiError::NotFound(ResourceType::Tag))?;
-            let tag_id = old_tag.id;
-            api::verify_version(old_tag.last_edit_time, body.version)?;
-
-            let mut new_tag = old_tag.clone();
-            let old_snapshot_data = SnapshotData::retrieve(conn, old_tag)?;
-            let mut new_snapshot_data = old_snapshot_data.clone();
-
-            if let Some(category) = body.category {
-                ctx.verify_privilege(Action::TagEditCategory)?;
-
-                let category_id: i64 = tag_category::table
-                    .select(tag_category::id)
-                    .filter(tag_category::name.eq(&category))
+        .transaction({
+            let ctx = ctx.clone();
+            move |conn| {
+                let tag_id = verify_visibility(conn, &ctx, &name)?;
+                let old_tag: Tag = tag::table
+                    .find(tag_id)
                     .first(conn)
                     .optional()?
-                    .ok_or(ApiError::NotFound(ResourceType::TagCategory))?;
-                new_tag.category_id = category_id;
-                new_snapshot_data.category = category;
-            }
-            if let Some(description) = body.description {
-                ctx.verify_privilege(Action::TagEditDescription)?;
-                new_tag.description = description.clone();
-                new_snapshot_data.description = description;
-            }
-            if let Some(names) = body.names {
-                ctx.verify_privilege(Action::TagEditName)?;
-                if names.is_empty() {
-                    return Err(ApiError::NoNamesGiven(ResourceType::Tag));
+                    .ok_or(ApiError::NotFound(ResourceType::Tag))?;
+                api::verify_version(old_tag.last_edit_time, body.version)?;
+
+                let mut new_tag = old_tag.clone();
+                let old_snapshot_data = SnapshotData::retrieve(conn, old_tag)?;
+                let mut new_snapshot_data = old_snapshot_data.clone();
+
+                if let Some(category) = body.category {
+                    ctx.verify_privilege(Action::TagEditCategory)?;
+
+                    let category_id: i64 = tag_category::table
+                        .select(tag_category::id)
+                        .filter(tag_category::name.eq(&category))
+                        .first(conn)
+                        .optional()?
+                        .ok_or(ApiError::NotFound(ResourceType::TagCategory))?;
+                    new_tag.category_id = category_id;
+                    new_snapshot_data.category = category;
+                }
+                if let Some(description) = body.description {
+                    ctx.verify_privilege(Action::TagEditDescription)?;
+                    new_tag.description = description.clone();
+                    new_snapshot_data.description = description;
+                }
+                if let Some(names) = body.names {
+                    ctx.verify_privilege(Action::TagEditName)?;
+                    if names.is_empty() {
+                        return Err(ApiError::NoNamesGiven(ResourceType::Tag));
+                    }
+
+                    update::tag::set_names(conn, &ctx.config, tag_id, &names)?;
+                    new_snapshot_data.names = names;
+                }
+                if let Some(implications) = body.implications {
+                    ctx.verify_privilege(Action::TagEditImplication)?;
+
+                    let (implied_ids, implications) =
+                        update::tag::get_or_create_tags(conn, &ctx, implications, FetchMode::Acyclic)?;
+                    update::tag::set_implications(conn, tag_id, &implied_ids)?;
+                    new_snapshot_data.implications = implications;
+                }
+                if let Some(suggestions) = body.suggestions {
+                    ctx.verify_privilege(Action::TagEditSuggestion)?;
+
+                    let (suggested_ids, suggestions) =
+                        update::tag::get_or_create_tags(conn, &ctx, suggestions, FetchMode::Acyclic)?;
+                    update::tag::set_suggestions(conn, tag_id, &suggested_ids)?;
+                    new_snapshot_data.suggestions = suggestions;
                 }
 
-                update::tag::set_names(conn, &ctx.config, tag_id, &names)?;
-                new_snapshot_data.names = names;
+                new_tag.last_edit_time = DateTime::now();
+                let _: Tag = new_tag.save_changes(conn)?;
+                snapshot::tag::modification_snapshot(conn, ctx.client, old_snapshot_data, new_snapshot_data)?;
+                Ok::<_, ApiError>(tag_id)
             }
-            if let Some(implications) = body.implications {
-                ctx.verify_privilege(Action::TagEditImplication)?;
-
-                let (implied_ids, implications) =
-                    update::tag::get_or_create_tag_ids(conn, &ctx, implications, FetchMode::Acyclic)?;
-                update::tag::set_implications(conn, tag_id, &implied_ids)?;
-                new_snapshot_data.implications = implications;
-            }
-            if let Some(suggestions) = body.suggestions {
-                ctx.verify_privilege(Action::TagEditSuggestion)?;
-
-                let (suggested_ids, suggestions) =
-                    update::tag::get_or_create_tag_ids(conn, &ctx, suggestions, FetchMode::Acyclic)?;
-                update::tag::set_suggestions(conn, tag_id, &suggested_ids)?;
-                new_snapshot_data.suggestions = suggestions;
-            }
-
-            new_tag.last_edit_time = DateTime::now();
-            let _: Tag = new_tag.save_changes(conn)?;
-            snapshot::tag::modification_snapshot(conn, ctx.client, old_snapshot_data, new_snapshot_data)?;
-            Ok::<_, ApiError>(tag_id)
         })
         .await?;
     connection_pool
@@ -534,10 +550,9 @@ async fn delete(
 
     connection_pool
         .transaction(move |conn| {
+            let tag_id = verify_visibility(conn, &ctx, &name)?;
             let tag: Tag = tag::table
-                .select(Tag::as_select())
-                .inner_join(tag_name::table)
-                .filter(tag_name::name.eq(name))
+                .find(tag_id)
                 .first(conn)
                 .optional()?
                 .ok_or(ApiError::NotFound(ResourceType::Tag))?;
@@ -551,25 +566,6 @@ async fn delete(
             Ok::<_, ApiError>(Json(()))
         })
         .await
-}
-
-fn verify_visibility(conn: &mut PgConnection, ctx: &Context, tag_name: &SmallString) -> ApiResult<i64> {
-    let (tag_id, category_name): (i64, SmallString) = tag::table
-        .inner_join(tag_name::table)
-        .inner_join(tag_category::table)
-        .select((tag::id, tag_category::name))
-        .filter(tag_name::name.eq(tag_name))
-        .first(conn)
-        .optional()?
-        .ok_or(ApiError::NotFound(ResourceType::Tag))?;
-
-    if ctx.client.rank == UserRank::Anonymous {
-        let preferences = &ctx.config.anonymous_preferences;
-        if preferences.tag_blacklist.contains(tag_name) || preferences.tag_category_blacklist.contains(&category_name) {
-            return Err(ApiError::Hidden(ResourceType::Tag));
-        }
-    }
-    Ok(tag_id)
 }
 
 #[cfg(test)]
@@ -595,7 +591,7 @@ mod test {
     async fn list() -> ApiResult<()> {
         const QUERY: &str = "GET /tags/?query";
         const PARAMS: &str = "-sort:name&limit=40&fields=names";
-        verify_response(&format!("{QUERY}=-sort:name&limit=40{FIELDS}"), "tag/list").await?;
+        verify_response(&format!("{QUERY}=-sort:name&limit=40{FIELDS}"), "tag/list/typical").await?;
 
         let filter_table = crate::search::tag::filter_table();
         for token in Token::iter() {
@@ -606,11 +602,11 @@ mod test {
                 ("", filter)
             };
             let query = format!("{QUERY}={sign}{token}:{filter} {PARAMS}");
-            let path = format!("tag/list_{token}_filtered");
+            let path = format!("tag/list/{token}_filtered");
             verify_response(&query, &path).await?;
 
             let query = format!("{QUERY}=sort:{token} {PARAMS}");
-            let path = format!("tag/list_{token}_sorted");
+            let path = format!("tag/list/{token}_sorted");
             verify_response(&query, &path).await?;
         }
         Ok(())
@@ -631,7 +627,7 @@ mod test {
         let mut conn = get_connection()?;
         let last_edit_time = get_last_edit_time(&mut conn)?;
 
-        verify_response(&format!("GET /tag/{NAME}/?{FIELDS}"), "tag/get").await?;
+        verify_response(&format!("GET /tag/{NAME}/?{FIELDS}"), "tag/get/typical").await?;
 
         let new_last_edit_time = get_last_edit_time(&mut conn)?;
         assert_eq!(new_last_edit_time, last_edit_time);
@@ -653,7 +649,7 @@ mod test {
         let mut conn = get_connection()?;
         let last_edit_time = get_last_edit_time(&mut conn)?;
 
-        verify_response(&format!("GET /tag-siblings/{NAME}/?{FIELDS}"), "tag/get_siblings").await?;
+        verify_response(&format!("GET /tag-siblings/{NAME}/?{FIELDS}"), "tag/get_siblings/typical").await?;
 
         let new_last_edit_time = get_last_edit_time(&mut conn)?;
         assert_eq!(new_last_edit_time, last_edit_time);
@@ -672,7 +668,7 @@ mod test {
         let mut conn = get_connection()?;
         let tag_count = get_tag_count(&mut conn)?;
 
-        verify_response(&format!("POST /tags/?{FIELDS}"), "tag/create").await?;
+        verify_response(&format!("POST /tags/?{FIELDS}"), "tag/create/typical").await?;
 
         let (tag_id, name): (i64, SmallString) = tag_name::table
             .select((tag_name::tag_id, tag_name::name))
@@ -682,7 +678,7 @@ mod test {
         let new_tag_count = get_tag_count(&mut conn)?;
         assert_eq!(new_tag_count, tag_count + 1);
 
-        verify_response(&format!("DELETE /tag/{name}/?{FIELDS}"), "tag/delete").await?;
+        verify_response(&format!("DELETE /tag/{name}/?{FIELDS}"), "tag/delete/typical").await?;
 
         let new_tag_count = get_tag_count(&mut conn)?;
         let has_tag: bool = diesel::select(exists(tag::table.find(tag_id))).first(&mut conn)?;
@@ -717,7 +713,7 @@ mod test {
             .filter(tag_name::name.eq(REMOVE))
             .first(&mut conn)?;
 
-        verify_response(&format!("POST /tag-merge/?{FIELDS}"), "tag/merge").await?;
+        verify_response(&format!("POST /tag-merge/?{FIELDS}"), "tag/merge/typical").await?;
 
         let has_tag: bool = diesel::select(exists(tag::table.find(remove_id))).first(&mut conn)?;
         assert!(!has_tag);
@@ -756,7 +752,7 @@ mod test {
         let mut conn = get_connection()?;
         let (tag, usage_count, implication_count, suggestion_count) = get_tag_info(&mut conn, NAME)?;
 
-        verify_response(&format!("PUT /tag/{NAME}/?{FIELDS}"), "tag/edit").await?;
+        verify_response(&format!("PUT /tag/{NAME}/?{FIELDS}"), "tag/edit/typical").await?;
 
         let new_name: SmallString = tag_name::table
             .select(tag_name::name)
@@ -774,7 +770,7 @@ mod test {
         assert_ne!(new_implication_count, implication_count);
         assert_ne!(new_suggestion_count, suggestion_count);
 
-        verify_response(&format!("PUT /tag/{new_name}/?{FIELDS}"), "tag/edit_restore").await?;
+        verify_response(&format!("PUT /tag/{new_name}/?{FIELDS}"), "tag/edit/restore").await?;
 
         let new_tag_id: i64 = tag::table.select(tag::id).order(tag::id.desc()).first(&mut conn)?;
         diesel::delete(tag::table.find(new_tag_id)).execute(&mut conn)?;
@@ -797,26 +793,19 @@ mod test {
         verify_response_with_user(
             UserRank::Anonymous,
             "GET /tags/?query=-sort:name&limit=9&fields=names,implications,suggestions",
-            "tag/list_with_preferences",
-        )
-        .await?;
-        verify_response_with_user(UserRank::Anonymous, "GET /tag/tagme", "tag/get_with_preferences").await?;
-        verify_response_with_user(
-            UserRank::Anonymous,
-            "GET /tag-siblings/rock/?fields=names,implications,suggestions",
-            "tag/get_siblings_with_preferences",
+            "tag/list/with_preferences",
         )
         .await?;
         verify_response_with_user(
             UserRank::Anonymous,
             "GET /tag-siblings/rock/?fields=names,implications,suggestions",
-            "tag/get_siblings_of_blacklisted",
+            "tag/get_siblings/with_preferences",
         )
         .await?;
         verify_response_with_user(
             UserRank::Anonymous,
             "PUT /tag/river/?fields=names,implications,suggestions",
-            "tag/edit_with_preferences",
+            "tag/edit/with_preferences",
         )
         .await?;
 
@@ -826,31 +815,96 @@ mod test {
 
     #[tokio::test]
     #[parallel]
+    async fn blacklisted() -> ApiResult<()> {
+        verify_response_with_user(UserRank::Anonymous, "GET /tag/tagme", "tag/get/blacklisted").await?;
+        verify_response_with_user(
+            UserRank::Anonymous,
+            "GET /tag-siblings/rock/?fields=names,implications,suggestions",
+            "tag/get_siblings/blacklisted",
+        )
+        .await?;
+        verify_response_with_user(UserRank::Anonymous, "PUT /tag/tagme", "tag/edit/blacklisted").await?;
+        verify_response_with_user(UserRank::Anonymous, "POST /tag-merge", "tag/merge/blacklisted").await?;
+        verify_response_with_user(UserRank::Anonymous, "DELETE /tag/tagme", "tag/delete/blacklisted").await
+    }
+
+    #[tokio::test]
+    #[parallel]
     async fn error() -> ApiResult<()> {
-        verify_response("GET /tag/none", "tag/get_nonexistent").await?;
-        verify_response("GET /tag-siblings/none", "tag/get_siblings_of_nonexistent").await?;
-        verify_response("POST /tag-merge", "tag/merge_to_nonexistent").await?;
-        verify_response("POST /tag-merge", "tag/merge_with_nonexistent").await?;
-        verify_response("PUT /tag/none", "tag/edit_nonexistent").await?;
-        verify_response("DELETE /tag/none", "tag/delete_nonexistent").await?;
+        verify_response("GET /tag/none", "tag/get/nonexistent").await?;
+        verify_response("GET /tag-siblings/none", "tag/get_siblings/of_nonexistent").await?;
+        verify_response("POST /tag-merge", "tag/merge/to_nonexistent").await?;
+        verify_response("POST /tag-merge", "tag/merge/with_nonexistent").await?;
+        verify_response("PUT /tag/none", "tag/edit/nonexistent").await?;
+        verify_response("DELETE /tag/none", "tag/delete/nonexistent").await?;
 
-        verify_response("POST /tags", "tag/create_nameless").await?;
-        verify_response("POST /tags", "tag/create_name_clash").await?;
-        verify_response("POST /tags", "tag/create_invalid_name").await?;
-        verify_response("POST /tags", "tag/create_invalid_category").await?;
-        verify_response("POST /tags", "tag/create_invalid_suggestion").await?;
-        verify_response("POST /tags", "tag/create_invalid_implication").await?;
-        verify_response("POST /tag-merge", "tag/self-merge").await?;
+        verify_response("POST /tags", "tag/create/nameless").await?;
+        verify_response("POST /tags", "tag/create/name_clash").await?;
+        verify_response("POST /tags", "tag/create/invalid_name").await?;
+        verify_response("POST /tags", "tag/create/invalid_category").await?;
+        verify_response("POST /tags", "tag/create/invalid_suggestion").await?;
+        verify_response("POST /tags", "tag/create/invalid_implication").await?;
+        verify_response("POST /tag-merge", "tag/merge/with_self").await?;
 
-        verify_response("PUT /tag/sky", "tag/edit_nameless").await?;
-        verify_response("PUT /tag/sky", "tag/edit_name_clash").await?;
-        verify_response("PUT /tag/sky", "tag/edit_invalid_name").await?;
-        verify_response("PUT /tag/sky", "tag/edit_invalid_category").await?;
-        verify_response("PUT /tag/sky", "tag/edit_invalid_suggestion").await?;
-        verify_response("PUT /tag/sky", "tag/edit_invalid_implication").await?;
-        verify_response("PUT /tag/plant", "tag/edit_cyclic_implication").await?;
+        verify_response("PUT /tag/sky", "tag/edit/nameless").await?;
+        verify_response("PUT /tag/sky", "tag/edit/name_clash").await?;
+        verify_response("PUT /tag/sky", "tag/edit/invalid_name").await?;
+        verify_response("PUT /tag/sky", "tag/edit/invalid_category").await?;
+        verify_response("PUT /tag/sky", "tag/edit/invalid_suggestion").await?;
+        verify_response("PUT /tag/sky", "tag/edit/invalid_implication").await?;
+        verify_response("PUT /tag/plant", "tag/edit/cyclic_implication").await?;
 
-        reset_sequence(ResourceType::Tag)?;
+        reset_sequence(ResourceType::Tag)
+    }
+
+    #[tokio::test]
+    #[parallel]
+    async fn unauthorized() -> ApiResult<()> {
+        const USER: UserRank = UserRank::Regular;
+
+        verify_response_with_user(USER, "GET /tags?limit=1", "tag/list/unauthorized").await?;
+        verify_response_with_user(USER, "GET /tag/sky", "tag/get/unauthorized").await?;
+        verify_response_with_user(USER, "GET /tag-siblings/sky", "tag/get_siblings/unauthorized").await?;
+        verify_response_with_user(USER, "POST /tags", "tag/create/unauthorized").await?;
+        verify_response_with_user(USER, "POST /tag-merge", "tag/merge/unauthorized").await?;
+        verify_response_with_user(USER, "PUT /tag/sky", "tag/edit/name_unauthorized").await?;
+        verify_response_with_user(USER, "PUT /tag/sky", "tag/edit/category_unauthorized").await?;
+        verify_response_with_user(USER, "PUT /tag/sky", "tag/edit/description_unauthorized").await?;
+        verify_response_with_user(USER, "PUT /tag/sky", "tag/edit/implication_unauthorized").await?;
+        verify_response_with_user(USER, "PUT /tag/sky", "tag/edit/suggestion_unauthorized").await?;
+        verify_response_with_user(USER, "DELETE /tag/sky", "tag/delete/unauthorized").await?;
+
+        // Ensure users can't get around lack of view privileges via other actions
+        verify_response_with_user(USER, "GET /tags?limit=1", "tag/list/view_unauthorized").await?;
+        verify_response_with_user(USER, "GET /tag-siblings/sky", "tag/get_siblings/view_unauthorized").await?;
+        verify_response_with_user(USER, "POST /tag-merge", "tag/merge/view_unauthorized").await?;
+        verify_response_with_user(USER, "PUT /tag/sky", "tag/edit/view_unauthorized").await
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn unicode_edge_cases() -> ApiResult<()> {
+        verify_response("POST /tags", "tag/create/unicode_name_clash").await?;
+        verify_response("POST /tags?fields=implications", "tag/create/unicode_implication_clash").await?;
+        verify_response("POST /tags?fields=suggestions", "tag/create/unicode_suggestion_clash").await?;
+        verify_response("PUT /tag/sky", "tag/edit/unicode_name_clash").await?;
+        verify_response("PUT /tag/sky?fields=implications", "tag/edit/unicode_implication_clash").await?;
+        verify_response("PUT /tag/sky?fields=suggestions", "tag/edit/unicode_suggestion_clash").await?;
+
+        reset_database();
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn blacklist_edge_case() -> ApiResult<()> {
+        // Create edge-case tag category name
+        verify_response("POST /tags?fields=names", "tag/create/blacklist_edge_case").await?;
+
+        // Try to view tag category using name with different casing
+        verify_response_with_user(UserRank::Anonymous, "GET /tag/κοσμοσ", "tag/get/blacklist_edge_case").await?;
+
+        reset_database();
         Ok(())
     }
 }

@@ -1,21 +1,46 @@
+use crate::content::hash;
 use crate::filesystem::Directory;
-use crate::model::enums::UserRank;
-use crate::string::SmallString;
+use crate::model::enums::{AvatarStyle, UserRank};
+use crate::search::preferences::Preferences;
+use crate::string::{SecretString, SmallString};
 use config::builder::DefaultState;
 use config::{ConfigBuilder, File, FileFormat};
 use lettre::message::Mailbox;
+use percent_encoding::{AsciiSet, CONTROLS, NON_ALPHANUMERIC};
 use regex::Regex;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::borrow::ToOwned;
 use std::collections::HashMap;
+use std::error::Error;
 use std::path::PathBuf;
+use std::sync::{Arc, LazyLock};
 use strum::{Display, EnumCount, EnumIter, EnumTable, IntoEnumIterator, IntoStaticStr};
 use url::Url;
 use utoipa::openapi::{ObjectBuilder, RefOr, Schema};
 use utoipa::{PartialSchema, ToSchema};
 
-#[derive(Debug, Display, Clone, Copy)]
+#[derive(Debug, Default)]
+pub struct Args {
+    pub admin_mode: bool,
+    pub config_path: Option<String>,
+    pub ffmpeg_path: Option<PathBuf>,
+    #[cfg(feature = "load_env")]
+    pub env_path: Option<PathBuf>,
+}
+
+pub struct Env {
+    pub http_origin: Option<String>,
+    pub http_referer: Option<String>,
+    pub domain_port: Option<u16>,
+    pub server_port: u16,
+    postgres_user: SecretString,
+    postgres_password: SecretString,
+    postgres_hostname: SecretString,
+    postgres_port: u16,
+    postgres_database: SecretString,
+}
+
+#[derive(Debug, Display, Clone, Copy, PartialEq, Eq)]
 #[strum(serialize_all = "lowercase")]
 pub enum RegexType {
     Pool,
@@ -28,7 +53,7 @@ pub enum RegexType {
     Password,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct ThumbnailConfig {
     pub avatar_width: u32,
     pub avatar_height: u32,
@@ -46,32 +71,13 @@ impl ThumbnailConfig {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct SmtpConfig {
-    pub host: SmallString,
+    pub host: SecretString,
     pub port: Option<u16>,
-    pub username: Option<SmallString>,
-    pub password: Option<SmallString>,
+    pub username: Option<SecretString>,
+    pub password: Option<SecretString>,
     pub from: Mailbox,
-}
-
-#[derive(Deserialize)]
-pub struct AnonymousPreferences {
-    pub tag_blacklist: Vec<SmallString>,
-    pub tag_category_blacklist: Vec<SmallString>,
-    pub hide_unsafe: bool,
-    pub hide_sketchy: bool,
-    pub hide_untagged: bool,
-}
-
-impl AnonymousPreferences {
-    pub fn is_empty(&self) -> bool {
-        self.tag_blacklist.is_empty()
-            && self.tag_category_blacklist.is_empty()
-            && !self.hide_unsafe
-            && !self.hide_sketchy
-            && !self.hide_untagged
-    }
 }
 
 #[derive(Clone, Copy, EnumCount, EnumIter, EnumTable, IntoStaticStr)]
@@ -203,6 +209,10 @@ impl<'de> Deserialize<'de> for PrivilegeConfig {
                 .remove(action_name)
                 .ok_or(serde::de::Error::missing_field(action_name))?;
         }
+        if let Some(unknown_field) = privilege_map.keys().next() {
+            static ACTION_NAMES: LazyLock<Vec<&str>> = LazyLock::new(|| Action::iter().map(<&str>::from).collect());
+            return Err(serde::de::Error::unknown_field(unknown_field, &ACTION_NAMES));
+        }
         Ok(required_ranks)
     }
 }
@@ -220,7 +230,7 @@ impl PartialSchema for PrivilegeConfig {
 
 impl ToSchema for PrivilegeConfig {}
 
-#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[schema(rename_all = "camelCase")] // ToSchema doesn't detect serde(rename_all(serialize = ...))
 #[serde(deny_unknown_fields, rename_all(serialize = "camelCase"))]
 pub struct PublicConfig {
@@ -228,7 +238,7 @@ pub struct PublicConfig {
     pub default_user_rank: UserRank,
     pub enable_safety: bool,
     pub contact_email: Option<SmallString>,
-    #[serde(default)]
+    #[serde(skip)]
     pub can_send_mails: bool,
     #[schema(rename = "userNameRegex", value_type = String, format = Regex)]
     #[serde(rename(serialize = "userNameRegex"), with = "serde_regex")]
@@ -245,14 +255,16 @@ pub struct PublicConfig {
     pub privileges: PrivilegeConfig,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(skip)]
+    pub args: Args,
     pub data_dir: PathBuf,
     pub data_url: String,
     pub webhooks: Vec<Url>,
-    pub password_secret: SmallString,
-    pub content_secret: SmallString,
+    pub password_secret: SecretString,
+    pub content_secret: SecretString,
     pub domain: Option<SmallString>,
     pub delete_source_files: bool,
     pub append_tag_implications_on_post_edit: bool,
@@ -265,18 +277,24 @@ pub struct Config {
     pub auto_explain: bool,
     pub thumbnails: ThumbnailConfig,
     pub smtp: Option<SmtpConfig>,
-    pub anonymous_preferences: AnonymousPreferences,
+    #[serde(default)]
+    pub anonymous_preferences: Preferences,
+    #[serde(default)]
+    pub restricted_preferences: Preferences,
+    #[serde(default)]
+    pub regular_preferences: Preferences,
+    #[serde(default)]
+    pub power_preferences: Preferences,
+    #[serde(default)]
+    pub moderator_preferences: Preferences,
+    #[serde(skip)] // Administrators have no server-wide preferences/blacklists
+    pub administrator_preferences: Preferences,
     pub public_info: PublicConfig,
 }
 
 impl Config {
     pub fn smtp(&self) -> Option<&SmtpConfig> {
         self.smtp.as_ref()
-    }
-
-    pub fn default_rank(&self) -> UserRank {
-        // Default user rank can't be anonymous
-        std::cmp::max(self.public_info.default_user_rank, UserRank::Restricted)
     }
 
     pub fn privileges(&self) -> &PrivilegeConfig {
@@ -299,65 +317,159 @@ impl Config {
         self.data_dir.join(folder)
     }
 
+    /// Returns a URL to either a custom or gravatar avatar depending on the given `avatar_style`.
+    pub fn avatar_url(&self, lowercase_username: &str, avatar_style: AvatarStyle) -> String {
+        match avatar_style {
+            AvatarStyle::Gravatar => hash::gravatar_url(self, lowercase_username),
+            AvatarStyle::Manual => self.custom_avatar_url(lowercase_username),
+        }
+    }
+
     /// Returns URL to custom user avatar.
-    pub fn custom_avatar_url(&self, username: &str) -> String {
-        format!("{}/avatars/{}.png", self.data_url, username.to_lowercase())
+    pub fn custom_avatar_url(&self, lowercase_username: &str) -> String {
+        // Encode characters that are invalid or could allow for file traversal, and the encode again for the URL
+        let encoded_username =
+            percent_encoding::utf8_percent_encode(lowercase_username, INVALID_USERNAME_CHARS).to_string();
+        let double_encoded_username = percent_encoding::utf8_percent_encode(&encoded_username, NON_ALPHANUMERIC);
+        format!("{}/avatars/{double_encoded_username}.png", self.data_url.trim_end_matches('/'))
     }
 
     /// Returns path to custom user avatar on disk.
-    pub fn custom_avatar_path(&self, username: &str) -> PathBuf {
-        let filename = format!("{}.png", username.to_lowercase());
+    pub fn custom_avatar_path(&self, lowercase_username: &str) -> PathBuf {
+        // Encode characters that could allow for file traversal
+        let encoded_username = percent_encoding::utf8_percent_encode(lowercase_username, INVALID_USERNAME_CHARS);
+        let filename = format!("{encoded_username}.png");
         self.path(Directory::Avatars).join(filename)
     }
 }
 
+/// Reads commandline args.
+pub fn read_args() -> Args {
+    let admin_mode = std::env::args().any(|arg| arg == "--admin");
+    let config_path = std::env::args().find_map(|arg| arg.strip_prefix("--config-path=").map(String::from));
+    let ffmpeg_path = std::env::args().find_map(|arg| arg.strip_prefix("--ffmpeg-path=").map(PathBuf::from));
+    #[cfg(feature = "load_env")]
+    let env_path = std::env::args().find_map(|arg| arg.strip_prefix("--env-path=").map(PathBuf::from));
+    Args {
+        admin_mode,
+        config_path,
+        ffmpeg_path,
+        #[cfg(feature = "load_env")]
+        env_path,
+    }
+}
+pub fn read_env(config: &Config) -> Result<Arc<Env>, Box<dyn Error>> {
+    const DEFAULT_SERVER_PORT: u16 = 6666;
+    const DEFAULT_POSTGRES_PORT: u16 = 5432;
+
+    load_dotenv(config)?;
+
+    let http_origin = std::env::var("HTTP_ORIGIN").ok();
+    let http_referer = std::env::var("HTTP_REFERER").ok();
+    let domain_port = std::env::var("PORT").ok().and_then(|port| port.parse().ok());
+
+    let server_port = std::env::var("SERVER_PORT")
+        .ok()
+        .and_then(|var| var.parse().ok())
+        .unwrap_or(DEFAULT_SERVER_PORT);
+
+    let postgres_user = std::env::var("POSTGRES_USER").map(SecretString::from)?;
+    let postgres_password = std::env::var("POSTGRES_PASSWORD").map(SecretString::from)?;
+    let postgres_hostname = SecretString::from(std::env::var("POSTGRES_HOST").unwrap_or_else(|_| "localhost".into()));
+    let postgres_port = std::env::var("POSTGRES_PORT")
+        .ok()
+        .and_then(|port| port.parse().ok())
+        .unwrap_or(DEFAULT_POSTGRES_PORT);
+    let postgres_database = std::env::var("POSTGRES_DB").map(SecretString::from)?;
+
+    Ok(Arc::new(Env {
+        http_origin,
+        http_referer,
+        domain_port,
+        server_port,
+        postgres_user,
+        postgres_password,
+        postgres_hostname,
+        postgres_port,
+        postgres_database,
+    }))
+}
+
 /// Deserializes the `config.toml`.
 /// Any values not present will default to the corresponding value in `config.toml.dist`.
-pub fn create() -> Config {
+pub fn create(args: Args) -> Arc<Config> {
     if cfg!(test) {
         panic!("Production config disallowed in test build!")
     } else {
-        let config_path = std::env::args().find_map(|arg| arg.strip_prefix("--config-path=").map(ToOwned::to_owned));
-        let config_path = config_path.as_deref().unwrap_or("config");
-        create_config(Some(config_path))
+        Arc::new(create_config(args))
     }
 }
 
 /// Creates a test config with an optional `override_relative_path` to override the default config.
 #[cfg(test)]
 pub fn test_config(override_relative_path: Option<&str>) -> Config {
-    let override_path = override_relative_path.map(|relative_path| format!("test/request/{relative_path}/config"));
-    create_config(override_path.as_deref())
+    let mut args = read_args();
+    args.config_path = override_relative_path.map(|relative_path| format!("test/request/{relative_path}/config"));
+    create_config(args)
 }
 
-pub fn port() -> u16 {
-    const DEFAULT_PORT: u16 = 6666;
-    std::env::var("SERVER_PORT")
-        .ok()
-        .and_then(|var| var.parse().ok())
-        .unwrap_or(DEFAULT_PORT)
+/// Returns a url for the database using `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_HOST`, and `POSTGRES_DB`
+/// environment variables. If `database_override` is not `None`, then it's value will be used in place of `POSTGRES_DB`.
+pub fn database_url(env: &Env, database_override: Option<&str>) -> SecretString {
+    // Percent-encode credentials to allow for special characters
+    let port = env.postgres_port;
+    let user = percent_encoding::utf8_percent_encode(env.postgres_user.read(), NON_ALPHANUMERIC);
+    let password = percent_encoding::utf8_percent_encode(env.postgres_password.read(), NON_ALPHANUMERIC);
+    let hostname = percent_encoding::utf8_percent_encode(env.postgres_hostname.read(), NON_ALPHANUMERIC);
+    let database = percent_encoding::utf8_percent_encode(
+        database_override.unwrap_or(env.postgres_database.read()),
+        NON_ALPHANUMERIC,
+    );
+    SecretString::from(format!("postgres://{user}:{password}@{hostname}:{port}/{database}"))
 }
 
-/// Returns a url for the database using `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_HOST`, and `POSTGRES_DATABASE`
-/// environment variables. If `database_override` is not `None`, then it's value will be used in place of `POSTGRES_DATABASE`.
-pub fn database_url(database_override: Option<&str>) -> String {
-    const DEFAULT_POSTGRES_PORT: u16 = 5432;
-    let user = std::env::var("POSTGRES_USER").expect("POSTGRES_USER must be defined in .env");
-    let password = std::env::var("POSTGRES_PASSWORD").expect("POSTGRES_PASSWORD must be defined in .env");
-    let hostname = std::env::var("POSTGRES_HOST").unwrap_or_else(|_| "localhost".into());
-    let port = std::env::var("POSTGRES_PORT")
-        .ok()
-        .and_then(|port| port.parse().ok())
-        .unwrap_or(DEFAULT_POSTGRES_PORT);
-    let database = std::env::var("POSTGRES_DB").expect("POSTGRES_DB must be defined in .env");
-    let database = database_override.unwrap_or(&database);
-
-    format!("postgres://{user}:{password}@{hostname}:{port}/{database}")
-}
+/// Set of characters that allow for file traversal or are invalid on Linux/Windows.
+const INVALID_USERNAME_CHARS: &AsciiSet = &CONTROLS
+    .add(b'/')
+    .add(b'\\')
+    .add(b'.')
+    .add(b'<')
+    .add(b'>')
+    .add(b':')
+    .add(b'"')
+    .add(b'|')
+    .add(b'?')
+    .add(b'*')
+    .add(b'%');
 
 const DEFAULT_CONFIG: &str = include_str!("../config.toml.dist");
 
-fn create_config(config_path: Option<&str>) -> Config {
+#[cfg(not(feature = "load_env"))]
+#[allow(clippy::unnecessary_wraps)]
+fn load_dotenv(_config: &Config) -> Result<(), std::convert::Infallible> {
+    Ok(())
+}
+
+#[cfg(feature = "load_env")]
+fn load_dotenv(config: &Config) -> dotenvy::Result<PathBuf> {
+    if let Some(env_path) = config.args.env_path.as_deref() {
+        // If env_path is specified in args, read from that path
+        dotenvy::from_filename(env_path)
+    } else {
+        // Otherwise, try to read a `.env` from the working directory or its parent
+        dotenvy::from_filename(".env").or_else(|_| dotenvy::from_filename("../.env"))
+    }
+}
+
+fn create_config(args: Args) -> Config {
+    let config_path = if let Some(config_path) = args.config_path.as_deref() {
+        Some(config_path)
+    } else if !cfg!(test) {
+        Some("config")
+    } else {
+        None
+    };
+
     let mut config_builder =
         ConfigBuilder::<DefaultState>::default().add_source(File::from_str(DEFAULT_CONFIG, FileFormat::Toml));
     if let Some(path) = config_path {
@@ -372,6 +484,16 @@ fn create_config(config_path: Option<&str>) -> Config {
             std::process::exit(1);
         }
     };
+    config.args = args;
     config.public_info.can_send_mails = config.smtp.is_some();
+    // Default user rank can't be anonymous
+    config.public_info.default_user_rank = std::cmp::max(config.public_info.default_user_rank, UserRank::Restricted);
+
+    // Accumulate preferences from higher user ranks
+    config.power_preferences.merge(&config.moderator_preferences);
+    config.regular_preferences.merge(&config.power_preferences);
+    config.restricted_preferences.merge(&config.regular_preferences);
+    config.anonymous_preferences.merge(&config.restricted_preferences);
+
     config
 }

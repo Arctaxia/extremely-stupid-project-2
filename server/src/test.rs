@@ -4,7 +4,7 @@ use crate::app::AppState;
 use crate::auth::header;
 use crate::config::Config;
 use crate::content::hash::{Checksum, Md5Checksum, PostHash};
-use crate::content::{decode, signature};
+use crate::content::{decode, download, signature};
 use crate::db::Connection;
 use crate::filesystem::Directory;
 use crate::model::comment::{NewComment, NewCommentScore};
@@ -14,7 +14,7 @@ use crate::model::enums::{
 use crate::model::pool::{NewPool, NewPoolName, PoolPost};
 use crate::model::pool_category::NewPoolCategory;
 use crate::model::post::{
-    NewPost, NewPostFeature, NewPostNote, NewPostSignature, PostFavorite, PostRelation, PostScore, PostTag,
+    NewPost, NewPostFavorite, NewPostFeature, NewPostNote, NewPostScore, NewPostSignature, PostRelation, PostTag,
 };
 use crate::model::tag::{NewTag, NewTagName, TagImplication, TagSuggestion};
 use crate::model::tag_category::NewTagCategory;
@@ -27,7 +27,7 @@ use crate::schema::{
 };
 use crate::string::SmallString;
 use crate::time::DateTime;
-use crate::{api, app, config, db};
+use crate::{api, config, db};
 use argon2::password_hash::rand_core::{OsRng, RngCore};
 use axum::ServiceExt;
 use axum::extract::Request;
@@ -134,7 +134,10 @@ pub async fn verify_response_with_credentials(
             Some("body.json") => body = Some(serde_json::from_str(&file_contents)?),
             Some("config.toml") => config = Some(config::test_config(Some(relative_path))),
             Some(file_name) => panic!("Unexpected file name {file_name} in {relative_path}"),
-            _ => panic!("Could not parse file name {:?} in {relative_path}", path.file_name()),
+            _ => panic!(
+                "Could not parse file name {} in {relative_path}",
+                path.file_name().unwrap_or(OsStr::new("")).display()
+            ),
         }
     }
 
@@ -340,9 +343,9 @@ const POSTS: &[NewPost] = &[
         safety: PostSafety::Safe,
         type_: PostType::Image,
         mime_type: MimeType::Jpeg,
-        checksum: Checksum::from_bytes(b"01"),
-        checksum_md5: Md5Checksum::from_bytes(b"01"),
-        flags: PostFlags::new(),
+        checksum: Checksum::from_bytes_test(b"01"),
+        checksum_md5: Md5Checksum::from_bytes_test(b"01"),
+        flags: PostFlags::none(),
         source: "starry_night.png",
         description: "0101100010",
     },
@@ -354,9 +357,9 @@ const POSTS: &[NewPost] = &[
         safety: PostSafety::Sketchy,
         type_: PostType::Animation,
         mime_type: MimeType::Gif,
-        checksum: Checksum::from_bytes(b"02"),
-        checksum_md5: Md5Checksum::from_bytes(b"02"),
-        flags: PostFlags::new(),
+        checksum: Checksum::from_bytes_test(b"02"),
+        checksum_md5: Md5Checksum::from_bytes_test(b"02"),
+        flags: PostFlags::none(),
         source: "gif.gif",
         description: "",
     },
@@ -368,9 +371,9 @@ const POSTS: &[NewPost] = &[
         safety: PostSafety::Safe,
         type_: PostType::Image,
         mime_type: MimeType::Bmp,
-        checksum: Checksum::from_bytes(b"03"),
-        checksum_md5: Md5Checksum::from_bytes(b"03"),
-        flags: PostFlags::new(),
+        checksum: Checksum::from_bytes_test(b"03"),
+        checksum_md5: Md5Checksum::from_bytes_test(b"03"),
+        flags: PostFlags::none(),
         source: "bmp.bmp",
         description: "",
     },
@@ -382,9 +385,9 @@ const POSTS: &[NewPost] = &[
         safety: PostSafety::Safe,
         type_: PostType::Image,
         mime_type: MimeType::Png,
-        checksum: Checksum::from_bytes(b"04"),
-        checksum_md5: Md5Checksum::from_bytes(b"04"),
-        flags: PostFlags::new(),
+        checksum: Checksum::from_bytes_test(b"04"),
+        checksum_md5: Md5Checksum::from_bytes_test(b"04"),
+        flags: PostFlags::none(),
         source: "1_pixel.png",
         description: "description9000",
     },
@@ -396,9 +399,9 @@ const POSTS: &[NewPost] = &[
         safety: PostSafety::Unsafe,
         type_: PostType::Video,
         mime_type: MimeType::Mp4,
-        checksum: Checksum::from_bytes(b"05"),
-        checksum_md5: Md5Checksum::from_bytes(b"05"),
-        flags: PostFlags::new_with(PostFlag::Sound),
+        checksum: Checksum::from_bytes_test(b"05"),
+        checksum_md5: Md5Checksum::from_bytes_test(b"05"),
+        flags: PostFlags::one(PostFlag::Sound),
         source: "mp4.mp4",
         description: "descriptor",
     },
@@ -459,22 +462,21 @@ fn get_state_guard() -> MutexGuard<'static, Option<AppState>> {
 }
 
 fn recreate_database() -> AdminResult<AppState> {
-    #[cfg(feature = "load_env")]
-    app::load_env().expect("Failed to load .env");
-
     let rng = &mut OsRng;
     let test_data_directory = std::env::temp_dir().join(rng.next_u64().to_string());
 
     let mut test_config = config::test_config(None);
     test_config.data_dir = test_data_directory;
 
+    let env = config::read_env(&test_config).expect("Must be able to read environment");
+
     // Drop and create test database via postgres database
     {
-        let postgres_url = config::database_url(Some("postgres"));
+        let postgres_url = config::database_url(&env, Some("postgres"));
         let postgres_connection_pool = Pool::builder()
             .max_size(1)
             .test_on_check_out(true)
-            .build(ConnectionManager::<PgConnection>::new(postgres_url))
+            .build(ConnectionManager::<PgConnection>::new(postgres_url.read()))
             .expect("Postgres connection pool must be constructible");
 
         let mut conn = postgres_connection_pool.get()?;
@@ -482,13 +484,15 @@ fn recreate_database() -> AdminResult<AppState> {
         diesel::sql_query(format!("CREATE DATABASE {DATABASE_NAME}")).execute(&mut conn)?;
     }
 
-    let test_url = config::database_url(Some(DATABASE_NAME));
-    let test_connection_pool = db::create_test_connection_pool(test_url);
+    let test_url = config::database_url(&env, Some(DATABASE_NAME));
+    let test_connection_pool = db::create_test_connection_pool(&test_url);
     db::run_database_migrations(&test_connection_pool).expect("Must be able to run test migrations");
 
     let mut conn = test_connection_pool.get_blocking()?;
     populate_database(&mut conn, &test_config)?;
-    Ok(AppState::new(test_connection_pool, test_config))
+
+    let downloader = download::create_client().expect("Must be able to create downloader client");
+    Ok(AppState::new(downloader, test_connection_pool, env, Arc::new(test_config)))
 }
 
 const fn new_user(name: &'static str, email: Option<&'static str>, rank: UserRank) -> NewUser<'static> {
@@ -595,9 +599,9 @@ fn create_pools(conn: &mut PgConnection) -> QueryResult<()> {
 
 fn create_posts(conn: &mut PgConnection, config: &Config) -> AdminResult<()> {
     for new_post in POSTS {
-        let (post_id, mime_type, source): (i64, MimeType, String) = new_post
+        let (post_id, mime_type, source, custom_thumbnail_size): (_, _, String, _) = new_post
             .insert_into(post::table)
-            .returning((post::id, post::mime_type, post::source))
+            .returning((post::id, post::mime_type, post::source, post::custom_thumbnail_size))
             .get_result(conn)?;
 
         // Simulate uploads
@@ -615,7 +619,7 @@ fn create_posts(conn: &mut PgConnection, config: &Config) -> AdminResult<()> {
             .values(post_signature)
             .execute(conn)?;
 
-        let post_hash = PostHash::new(config, post_id);
+        let post_hash = PostHash::new(config, post_id, Some(custom_thumbnail_size));
 
         let content_path = post_hash.content_path(mime_type);
         std::fs::create_dir_all(content_path.parent().unwrap_or(Path::new("")))?;
@@ -679,34 +683,25 @@ fn populate_database(conn: &mut PgConnection, config: &Config) -> AdminResult<()
 
     // Add favorites
     for &(user_id, post_id) in POST_FAVORITES {
-        PostFavorite {
-            post_id,
-            user_id,
-            time: DateTime::now(),
-        }
-        .insert_into(post_favorite::table)
-        .execute(conn)?;
+        NewPostFavorite { post_id, user_id }
+            .insert_into(post_favorite::table)
+            .execute(conn)?;
     }
 
     // Add features
     for &(user_id, post_id) in POST_FEATURES {
-        NewPostFeature {
-            user_id,
-            post_id,
-            time: DateTime::now(),
-        }
-        .insert_into(post_feature::table)
-        .execute(conn)?;
+        NewPostFeature { post_id, user_id }
+            .insert_into(post_feature::table)
+            .execute(conn)?;
     }
 
     // Add scores
     let new_scores: Vec<_> = POST_SCORES
         .iter()
-        .map(|&(user_id, post_id, score)| PostScore {
+        .map(|&(user_id, post_id, score)| NewPostScore {
             post_id,
             user_id,
             score,
-            time: DateTime::now(),
         })
         .collect();
     new_scores.insert_into(post_score::table).execute(conn)?;
@@ -722,14 +717,9 @@ fn populate_database(conn: &mut PgConnection, config: &Config) -> AdminResult<()
 
     // Add comments
     for &(user_id, post_id, text) in COMMENTS {
-        NewComment {
-            user_id,
-            post_id,
-            text,
-            creation_time: DateTime::now(),
-        }
-        .insert_into(comment::table)
-        .execute(conn)?;
+        NewComment { user_id, post_id, text }
+            .insert_into(comment::table)
+            .execute(conn)?;
     }
 
     // Add comment scores
@@ -835,7 +825,7 @@ mod statistics_tests {
         let stats: Vec<(SmallString, i64)> = pool_statistics::table
             .inner_join(pool_name::table.on(pool_name::pool_id.eq(pool_statistics::pool_id)))
             .select((pool_name::name, pool_statistics::post_count))
-            .filter(PoolName::primary())
+            .filter(PoolName::is_primary())
             .load(&mut conn)?;
         for (pool_name, post_count) in stats {
             let exepected_post_count = POOL_POSTS.iter().filter(|&&(name, _)| *name == *pool_name).count() as i64;
@@ -912,7 +902,7 @@ mod statistics_tests {
         let stats: Vec<(SmallString, i64)> = tag_statistics::table
             .inner_join(tag_name::table.on(tag_name::tag_id.eq(tag_statistics::tag_id)))
             .select((tag_name::name, tag_statistics::usage_count))
-            .filter(TagName::primary())
+            .filter(TagName::is_primary())
             .load(&mut conn)?;
         for (tag_name, usage_count) in stats {
             let expected_usage_count = POST_TAGS

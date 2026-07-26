@@ -8,9 +8,9 @@ use crate::schema::{
     post_note, post_score, post_statistics, post_tag, tag, tag_category, tag_name, user,
 };
 use crate::search::{
-    self, Builder, CacheState, Condition, Order, ParsedSort, SearchCriteria, StrCondition, UnparsedFilter, parse,
-    preferences,
+    Builder, CacheState, Condition, Order, ParsedSort, SearchCriteria, StrCondition, UnparsedFilter, parse,
 };
+use crate::string::lower;
 use crate::{
     apply_cache_filters, apply_distinct_if_multivalued, apply_filter, apply_random_sort, apply_sort, apply_str_filter,
     apply_time_filter, update_filter_cache, update_nonmatching_filter_cache,
@@ -102,7 +102,7 @@ impl<'a> Builder<'a> for QueryBuilder<'a> {
     }
 
     fn count(&mut self, conn: &mut PgConnection) -> ApiResult<i64> {
-        if self.search.has_filter() || preferences::has_preferences(self.search.ctx) {
+        if self.search.has_filter() || !self.search.ctx.preferences().is_empty() {
             let unsorted_query = self.build_filtered(conn)?;
             unsorted_query.count().first(conn)
         } else {
@@ -166,7 +166,7 @@ impl<'a> Builder<'a> for QueryBuilder<'a> {
         if let Some(nonmatching) = nonmatching_posts {
             update_nonmatching_filter_cache!(conn, nonmatching, self.cache_state)?;
         }
-        if let Some(hidden_posts) = preferences::hidden_posts(self.search.ctx, post::id) {
+        if let Some(hidden_posts) = self.search.ctx.preferences().hidden_posts(post::id) {
             query = query.filter(not(exists(hidden_posts)));
         }
         Ok(apply_cache_filters!(query, post::id, self.cache_state))
@@ -243,7 +243,7 @@ impl<'a> QueryBuilder<'a> {
 
         Ok(Self {
             search,
-            cache_state: CacheState::new(),
+            cache_state: CacheState::default(),
         })
     }
 }
@@ -290,7 +290,7 @@ fn apply_checksum_filter(query: BoxedQuery, filter: UnparsedFilter<Token>) -> Ap
 
 fn apply_flag_filter(query: BoxedQuery, filter: UnparsedFilter<Token>) -> ApiResult<BoxedQuery> {
     let flags: Vec<PostFlag> = parse::values(filter.condition)?;
-    let value = flags.into_iter().fold(PostFlags::new(), |value, flag| value | flag);
+    let value = flags.into_iter().fold(PostFlags::none(), |value, flag| value | flag);
     let bitwise_and = sql::<SmallInt>("")
         .bind(post::flags)
         .sql(" & ")
@@ -326,7 +326,7 @@ fn apply_tag_filter(
             StrCondition::Regular(Condition::Range(range)) => {
                 nonmatching.or_filter(tag_name::name.between(range.start, range.end))
             }
-            StrCondition::WildCard(pattern) => nonmatching.or_filter(search::lower(tag_name::name).like(pattern)),
+            StrCondition::WildCard(pattern) => nonmatching.or_filter(lower(tag_name::name).like(pattern)),
         };
         nonmatching_posts.replace(nonmatching);
     } else {

@@ -1,0 +1,14 @@
+{
+    "limit": 40,
+    "offset": 0,
+    "query": "-author:*user* -sort:id",
+    "results": [
+        {
+            "id": 2
+        },
+        {
+            "id": 4
+        }
+    ],
+    "total": 2
+}

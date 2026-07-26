@@ -1,8 +1,11 @@
 use crate::admin::AdminTask;
 use crate::api::error::{ApiError, ApiResult};
 use crate::app::AppState;
+use crate::config::{Config, Env};
 use crate::content::signature::SIGNATURE_VERSION;
 use crate::schema::database_statistics;
+#[cfg(test)]
+use crate::string::SecretString;
 use crate::{admin, app, config};
 use diesel::migration::Migration;
 use diesel::pg::Pg;
@@ -14,35 +17,36 @@ use std::convert::AsMut;
 use std::error::Error;
 use std::num::ParseIntError;
 use std::ops::RangeInclusive;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Semaphore, SemaphorePermit};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{error, info};
 
 pub type Connection = PooledConnection<ConnectionManager<PgConnection>>;
-pub type AsyncConnectionResult<'a> = Result<AsyncConnection<'a>, PoolError>;
+pub type AsyncConnectionResult = Result<AsyncConnection, PoolError>;
 
-pub struct AsyncConnection<'a> {
+pub struct AsyncConnection {
     conn: Connection,
     #[allow(dead_code)]
-    permit: SemaphorePermit<'a>,
+    permit: OwnedSemaphorePermit,
 }
 
-impl AsMut<PgConnection> for AsyncConnection<'_> {
+impl AsMut<PgConnection> for AsyncConnection {
     fn as_mut(&mut self) -> &mut PgConnection {
         &mut self.conn
     }
 }
 
+#[derive(Clone)]
 pub struct AsyncConnectionPool {
     pool: Pool<ConnectionManager<PgConnection>>,
-    semaphore: Semaphore,
+    semaphore: Arc<Semaphore>,
 }
 
 impl AsyncConnectionPool {
-    pub async fn get(&self) -> AsyncConnectionResult<'_> {
-        let permit = self.semaphore.acquire().await.expect(SEMAPHORE_PANIC_MESSAGE);
-        let conn = self.pool.get()?;
-        Ok(AsyncConnection { conn, permit })
+    pub async fn get(&self) -> AsyncConnectionResult {
+        let permit = self.acquire_permit().await;
+        self.pool.get().map(|conn| AsyncConnection { conn, permit })
     }
 
     pub fn get_blocking(&self) -> Result<Connection, PoolError> {
@@ -56,16 +60,28 @@ impl AsyncConnectionPool {
         F: FnOnce(&mut Connection) -> Result<T, E> + Send + 'static,
         ApiError: From<E>,
     {
-        let _permit = self.semaphore.acquire().await.expect(SEMAPHORE_PANIC_MESSAGE);
+        let permit = self.acquire_permit().await;
         let mut conn = self.pool.get()?;
-        tokio::task::spawn_blocking(move || conn.transaction(f))
-            .await?
-            .map_err(ApiError::from)
+        tokio::task::spawn_blocking(move || {
+            // Permit is moved inside blocking task so it is held even if future is dropped
+            let _permit = permit;
+            conn.transaction(f)
+        })
+        .await?
+        .map_err(ApiError::from)
+    }
+
+    async fn acquire_permit(&self) -> OwnedSemaphorePermit {
+        self.semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect(SEMAPHORE_PANIC_MESSAGE)
     }
 }
 
 /// Creates a connection pool to the database.
-pub fn create_connection_pool() -> AsyncConnectionPool {
+pub fn create_connection_pool(env: &Env, config: Arc<Config>) -> Result<AsyncConnectionPool, PoolError> {
     if cfg!(test) {
         panic!("Connection to production database disallowed in test build!")
     } else {
@@ -73,39 +89,38 @@ pub fn create_connection_pool() -> AsyncConnectionPool {
             tokio::runtime::Handle::try_current().map_or(1, |handle| handle.metrics().num_workers());
         let max_conns = std::cmp::max(num_tokio_threads, app::num_rayon_threads()) + 1;
 
-        let pool = Pool::builder()
+        let semaphore = Arc::new(Semaphore::new(max_conns));
+        Pool::builder()
             .max_size(u32::try_from(max_conns).expect("Number of connections will never be greater than u32::MAX"))
             .max_lifetime(None)
             .idle_timeout(None)
             .test_on_check_out(true)
-            .connection_customizer(Box::new(ConnectionInitialzier {}))
-            .build(ConnectionManager::new(config::database_url(None)))
-            .expect("Connection pool must be constructible");
-        let semaphore = Semaphore::new(max_conns);
-        AsyncConnectionPool { pool, semaphore }
+            .connection_customizer(Box::new(ConnectionInitialzier { config }))
+            .build(ConnectionManager::new(config::database_url(env, None).read()))
+            .map(|pool| AsyncConnectionPool { pool, semaphore })
     }
 }
 
 #[cfg(test)]
-pub fn create_test_connection_pool(test_url: String) -> AsyncConnectionPool {
+pub fn create_test_connection_pool(test_url: &SecretString) -> AsyncConnectionPool {
     let pool = Pool::builder()
         .max_lifetime(None)
         .idle_timeout(None)
         .test_on_check_out(true)
-        .build(ConnectionManager::new(test_url))
+        .build(ConnectionManager::new(test_url.read()))
         .expect("Test connection pool must be constructible");
-    let semaphore = Semaphore::new(usize::try_from(pool.max_size()).unwrap());
+    let semaphore = Arc::new(Semaphore::new(usize::try_from(pool.max_size()).unwrap()));
     AsyncConnectionPool { pool, semaphore }
 }
 
 /// Runs embedded migrations on the database. Used to update database for end-users who don't build server themselves.
 pub fn run_database_migrations(
     connection_pool: &AsyncConnectionPool,
-) -> Result<RangeInclusive<i32>, Box<dyn Error + Send + Sync>> {
+) -> Result<Option<RangeInclusive<i32>>, Box<dyn Error + Send + Sync>> {
     let mut conn = connection_pool.get_blocking()?;
     let pending_migrations = conn.pending_migrations(MIGRATIONS)?;
     if pending_migrations.is_empty() {
-        return Ok(RangeInclusive::new(1, 0));
+        return Ok(None);
     }
 
     let migration_number = |migration: &dyn Migration<Pg>| -> Result<i32, ParseIntError> {
@@ -119,7 +134,7 @@ pub fn run_database_migrations(
 
     info!("Running pending migrations...");
     conn.run_pending_migrations(MIGRATIONS)?;
-    Ok(migration_range)
+    Ok(Some(migration_range))
 }
 
 /// Runs other server-related migrations, like restructuring data folder or recomputing signatures
@@ -194,12 +209,13 @@ const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 const SEMAPHORE_PANIC_MESSAGE: &str = "Semaphore should never close";
 
 #[derive(Debug)]
-struct ConnectionInitialzier {}
+struct ConnectionInitialzier {
+    config: Arc<Config>,
+}
 
 impl CustomizeConnection<PgConnection, diesel::r2d2::Error> for ConnectionInitialzier {
     fn on_acquire(&self, conn: &mut PgConnection) -> Result<(), diesel::r2d2::Error> {
-        let config = config::create();
-        if config.auto_explain {
+        if self.config.auto_explain {
             diesel::sql_query("LOAD 'auto_explain';").execute(conn)?;
             diesel::sql_query("SET SESSION auto_explain.log_min_duration = 500;").execute(conn)?;
             diesel::sql_query("SET SESSION auto_explain.log_parameter_max_length = 0;").execute(conn)?;

@@ -1,15 +1,18 @@
 use crate::api::error::{ApiError, ApiResult};
 use crate::api::middleware;
 use crate::auth::Client;
-use crate::config::{Action, Config};
+use crate::config::{Action, Config, Env};
 use crate::content::cache::RingCache;
 use crate::db::AsyncConnectionPool;
 use crate::extract::Ctx;
-use crate::{admin, api, config, db, filesystem};
+use crate::model::enums::UserRank;
+use crate::search::preferences::Preferences;
+use crate::{admin, api, db, filesystem};
 use axum::Router;
-use std::borrow::ToOwned;
+use reqwest::Client as HttpClient;
 use std::error::Error;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::fmt::Display;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use tokio::net::TcpListener;
 use tokio::runtime::Handle;
 #[cfg(unix)]
@@ -24,18 +27,27 @@ use utoipa_swagger_ui::SwaggerUi;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub connection_pool: Arc<AsyncConnectionPool>,
+    pub env: Arc<Env>,
     pub config: Arc<Config>,
+    pub downloader: HttpClient,
+    pub connection_pool: AsyncConnectionPool,
     pub content_cache: Arc<Mutex<RingCache>>,
 }
 
 impl AppState {
-    pub fn new(connection_pool: AsyncConnectionPool, config: Config) -> Self {
+    pub fn new(
+        downloader: HttpClient,
+        connection_pool: AsyncConnectionPool,
+        env: Arc<Env>,
+        config: Arc<Config>,
+    ) -> Self {
         /// Max number of elements in the content cache. Should be as large as the number of users expected to be uploading concurrently.
         const CONTENT_CACHE_SIZE: usize = 10;
         Self {
-            connection_pool: Arc::new(connection_pool),
-            config: Arc::new(config),
+            env,
+            config,
+            downloader,
+            connection_pool,
             content_cache: Arc::new(Mutex::new(RingCache::new(CONTENT_CACHE_SIZE))),
         }
     }
@@ -45,6 +57,7 @@ impl AppState {
             Context {
                 client,
                 config: self.config,
+                downloader: self.downloader,
                 content_cache: self.content_cache,
             },
             self.connection_pool,
@@ -54,8 +67,9 @@ impl AppState {
 
 #[derive(Clone)]
 pub struct Context {
-    pub client: Client,
     pub config: Arc<Config>,
+    pub client: Client,
+    pub downloader: HttpClient,
     pub content_cache: Arc<Mutex<RingCache>>,
 }
 
@@ -73,14 +87,17 @@ impl Context {
     }
 
     pub fn get_content_cache(&self) -> MutexGuard<'_, RingCache> {
-        match self.content_cache.lock() {
-            Ok(guard) => guard,
-            Err(err) => {
-                error!("Content cache has been poisoned! Resetting...");
-                let mut guard = err.into_inner();
-                guard.clear();
-                guard
-            }
+        self.content_cache.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub fn preferences(&self) -> &Preferences {
+        match self.client.rank {
+            UserRank::Anonymous => &self.config.anonymous_preferences,
+            UserRank::Restricted => &self.config.restricted_preferences,
+            UserRank::Regular => &self.config.regular_preferences,
+            UserRank::Power => &self.config.power_preferences,
+            UserRank::Moderator => &self.config.moderator_preferences,
+            UserRank::Administrator => &self.config.administrator_preferences,
         }
     }
 }
@@ -93,39 +110,28 @@ pub fn num_rayon_threads() -> usize {
 }
 
 /// Initializes logging using [`tracing_subscriber`].
-pub fn enable_tracing(state: &AppState) {
+pub fn enable_tracing(config: &Config) {
     let initialize = |filter: EnvFilter| {
         tracing_subscriber::registry()
             .with(filter)
             .with(tracing_subscriber::fmt::layer().without_time())
             .init();
     };
-    match EnvFilter::try_new(&state.config.log_filter) {
+    match EnvFilter::try_new(&config.log_filter) {
         Ok(filter) => initialize(filter),
         Err(err) => {
-            initialize(EnvFilter::new(&state.config.log_filter));
+            initialize(EnvFilter::new(&config.log_filter));
             warn!("Log filter is invalid. Some or all directives may be ignored. Details:\n{err}");
         }
     }
 }
 
-#[cfg(feature = "load_env")]
-pub fn load_env() -> dotenvy::Result<()> {
-    if let Some(env_path) = std::env::args().find_map(|arg| arg.strip_prefix("--env-path=").map(ToOwned::to_owned)) {
-        // If env_path is specified in args, read from that path
-        dotenvy::from_filename(env_path)
-    } else {
-        // Otherwise, try to read a `.env` from the working directory or its parent
-        dotenvy::from_filename(".env").or_else(|_| dotenvy::from_filename("../.env"))
-    }
-    .map(|_| ())
-}
-
 pub fn initialize(state: &AppState) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let migration_range = db::run_database_migrations(&state.connection_pool)?;
-    db::run_server_migrations(state, migration_range)?;
+    if let Some(migration_range) = db::run_database_migrations(&state.connection_pool)? {
+        db::run_server_migrations(state, migration_range)?;
+    }
 
-    if admin::enabled() {
+    if state.config.args.admin_mode {
         admin::command_line_mode(state);
         std::process::exit(0);
     }
@@ -133,15 +139,13 @@ pub fn initialize(state: &AppState) -> Result<(), Box<dyn Error + Send + Sync>> 
     let mut conn = state.connection_pool.get_blocking()?;
     db::check_signature_version(&mut conn)?; // We do this after admin mode check so that users can update signatures
     middleware::initialize_snapshot_counter(&mut conn)?;
-
-    if let Err(err) = filesystem::purge_temporary_uploads(&state.config) {
-        warn!("Failed to purge temporary files. Details:\n{err}");
-    }
     filesystem::spawn_temporary_uploads_cleanup_task(Arc::clone(&state.config));
     Ok(())
 }
 
 pub async fn run(state: AppState) -> std::io::Result<()> {
+    let server_port = state.env.server_port;
+
     let (router, api) = api::routes(state).split_for_parts();
     let normalized_router = ServiceBuilder::new()
         .layer(NormalizePathLayer::trim_trailing_slash())
@@ -150,13 +154,18 @@ pub async fn run(state: AppState) -> std::io::Result<()> {
         .merge(SwaggerUi::new("/docs").url("/apidoc/openapi.json", api))
         .fallback_service(normalized_router);
 
-    let address = format!("0.0.0.0:{}", config::port());
+    let address = format!("0.0.0.0:{server_port}");
     let listener = TcpListener::bind(address).await?;
     info!("Oxibooru server running on {} threads", Handle::current().metrics().num_workers());
     debug!("listening on {}", listener.local_addr()?);
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
+}
+
+pub fn shutdown<E: Display>(message: &str, error: E) -> ! {
+    error!("{message}. Details:\n{error}");
+    std::process::exit(1)
 }
 
 async fn shutdown_signal() {

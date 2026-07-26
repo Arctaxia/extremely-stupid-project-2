@@ -1,18 +1,20 @@
 use crate::app::AppState;
 use crate::auth::{self, Client};
-use crate::model::enums::UserRank;
 use crate::schema::{user, user_token};
 use crate::time::DateTime;
 use base64::prelude::BASE64_STANDARD;
 use base64::{DecodeError, Engine};
 use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, RunQueryDsl};
 use std::str::Utf8Error;
+use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
 
 #[derive(Debug, Error)]
 #[error(transparent)]
 pub enum AuthenticationError {
+    #[error("Token has been disabled")]
+    DisabledToken,
     #[error("Token has expired")]
     ExpiredToken,
     FailedConnection(#[from] diesel::r2d2::PoolError),
@@ -67,20 +69,29 @@ fn decode_credentials(credentials: &str) -> Result<(String, String), Authenticat
 /// and that the username/password combination is valid.
 async fn basic_access_authentication(state: &AppState, credentials: &str) -> Result<Client, AuthenticationError> {
     let (username, password) = decode_credentials(credentials)?;
-    let mut conn = state.connection_pool.get().await?;
+    let (user_id, rank, password_hash): (_, _, String) = {
+        let mut conn = state.connection_pool.get().await?;
 
-    // For security reasons, don't give any indication to the user if it was the password
-    // or the username that was incorrect.
-    let (user_id, rank, password_hash): (i64, UserRank, String) = user::table
-        .select((user::id, user::rank, user::password_hash))
-        .filter(user::name.eq(username))
-        .first(conn.as_mut())
-        .optional()?
-        .ok_or(AuthenticationError::UsernamePasswordMismatch)?;
-    auth::password::is_valid_password(&state.config, &password_hash, &password)
-        .is_ok()
-        .then_some(Client::new(Some(user_id), rank))
-        .ok_or(AuthenticationError::UsernamePasswordMismatch)
+        // For security reasons, don't give any indication to the user if it was the password
+        // or the username that was incorrect.
+        user::table
+            .select((user::id, user::rank, user::password_hash))
+            .filter(user::name.eq(username))
+            .first(conn.as_mut())
+            .optional()?
+            .ok_or(AuthenticationError::UsernamePasswordMismatch)
+    }?;
+    tokio::task::spawn_blocking({
+        let config = Arc::clone(&state.config);
+        move || {
+            auth::password::is_valid_password(&config, &password_hash, &password)
+                .is_ok()
+                .then_some(Client::new(Some(user_id), rank))
+                .ok_or(AuthenticationError::UsernamePasswordMismatch)
+        }
+    })
+    .await
+    .unwrap()
 }
 
 /// Checks that the given `credentials` are of the form "username:token"
@@ -90,7 +101,7 @@ async fn token_authentication(state: &AppState, credentials: &str) -> Result<Cli
     let token = Uuid::parse_str(&unparsed_token)?;
     let mut conn = state.connection_pool.get().await?;
 
-    let (user_id, rank, enabled, expiration_time): (i64, UserRank, bool, Option<DateTime>) = user_token::table
+    let (user_id, rank, enabled, expiration): (_, _, bool, Option<DateTime>) = user_token::table
         .inner_join(user::table)
         .select((user::id, user::rank, user_token::enabled, user_token::expiration_time))
         .filter(user::name.eq(username))
@@ -98,9 +109,11 @@ async fn token_authentication(state: &AppState, credentials: &str) -> Result<Cli
         .first(conn.as_mut())
         .optional()?
         .ok_or(AuthenticationError::UsernameTokenMismatch)?;
-
-    let expired = expiration_time.as_ref().is_some_and(|&time| time < DateTime::now());
-    (enabled && !expired)
-        .then_some(Client::new(Some(user_id), rank))
-        .ok_or(AuthenticationError::ExpiredToken)
+    if !enabled {
+        Err(AuthenticationError::DisabledToken)
+    } else if expiration.is_some_and(|expiration_time| DateTime::now() > expiration_time) {
+        Err(AuthenticationError::ExpiredToken)
+    } else {
+        Ok(Client::new(Some(user_id), rank))
+    }
 }

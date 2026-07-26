@@ -4,18 +4,17 @@ use crate::config::Config;
 use crate::content::hash::PostHash;
 use crate::content::thumbnail::ThumbnailCategory;
 use crate::filesystem;
-use crate::model::comment::NewComment;
+use crate::model::comment::OrphanedComment;
 use crate::model::enums::{ResourceProperty, ResourceType};
 use crate::model::pool::PoolPost;
 use crate::model::post::{
-    CompressedSignature, NewPostFeature, Post, PostFavorite, PostRelation, PostScore, PostTag, SignatureIndexes,
+    CompressedSignature, OrphanedPostFeature, Post, PostFavorite, PostRelation, PostScore, PostTag, SignatureIndexes,
 };
 use crate::resource::post::Note;
 use crate::schema::{
     comment, pool_post, post, post_favorite, post_feature, post_note, post_relation, post_score, post_signature,
     post_tag,
 };
-use crate::search::preferences;
 use crate::time::DateTime;
 use diesel::dsl::exists;
 use diesel::{ExpressionMethods, Insertable, PgConnection, QueryDsl, QueryResult, RunQueryDsl};
@@ -34,7 +33,7 @@ pub fn last_edit_time(conn: &mut PgConnection, post_id: i64) -> ApiResult<()> {
 pub fn thumbnail(
     conn: &mut PgConnection,
     post_hash: &PostHash,
-    thumbnail: &DynamicImage,
+    thumbnail: DynamicImage,
     thumbnail_type: ThumbnailCategory,
 ) -> ApiResult<()> {
     filesystem::delete_post_thumbnail(post_hash, thumbnail_type)?;
@@ -58,7 +57,7 @@ pub fn set_relations(
     new_related_posts: &mut Vec<i64>,
 ) -> ApiResult<()> {
     // Add relations client doesn't know about
-    if let Some(hidden_posts) = preferences::hidden_posts(ctx, post_relation::child_id) {
+    if let Some(hidden_posts) = ctx.preferences().hidden_posts(post_relation::child_id) {
         let hidden_relations: Vec<i64> = post_relation::table
             .select(post_relation::child_id)
             .filter(post_relation::parent_id.eq(post_id))
@@ -127,6 +126,11 @@ pub fn set_notes(conn: &mut PgConnection, post_id: i64, notes: &[Note]) -> Query
 }
 
 /// Merges `absorbed_post` to `merge_to_post`.
+///
+/// Merged post resources typically follow a delete-then-insert pattern even
+/// if just updating the rows is more efficient. This is because we use triggers
+/// to count post statistics like tag count, comment count, etc. and most of
+/// these triggers only fire when inserting or deleting rows.
 pub fn merge(
     conn: &mut PgConnection,
     config: &Config,
@@ -136,8 +140,8 @@ pub fn merge(
 ) -> ApiResult<()> {
     let absorbed_id = absorbed_post.id;
     let merge_to_id = merge_to_post.id;
-    let absorbed_hash = PostHash::new(config, absorbed_id);
-    let merge_to_hash = PostHash::new(config, merge_to_id);
+    let absorbed_hash = PostHash::new(config, absorbed_id, Some(absorbed_post.custom_thumbnail_size));
+    let merge_to_hash = PostHash::new(config, merge_to_id, Some(merge_to_post.custom_thumbnail_size));
 
     // Merge relations
     let involved_relations: Vec<PostRelation> = post_relation::table
@@ -247,7 +251,7 @@ pub fn merge(
         .returning((post_feature::user_id, post_feature::time))
         .get_results(conn)?
         .into_iter()
-        .map(|(user_id, time)| NewPostFeature {
+        .map(|(user_id, time)| OrphanedPostFeature {
             post_id: merge_to_id,
             user_id,
             time,
@@ -256,16 +260,18 @@ pub fn merge(
     new_features.insert_into(post_feature::table).execute(conn)?;
 
     // Merge comments
-    let removed_comments: Vec<(_, String, _)> = diesel::delete(comment::table.filter(comment::post_id.eq(absorbed_id)))
-        .returning((comment::user_id, comment::text, comment::creation_time))
-        .get_results(conn)?;
+    let removed_comments: Vec<(_, String, _, _)> =
+        diesel::delete(comment::table.filter(comment::post_id.eq(absorbed_id)))
+            .returning((comment::user_id, comment::text, comment::creation_time, comment::last_edit_time))
+            .get_results(conn)?;
     let new_comments: Vec<_> = removed_comments
-        .iter()
-        .map(|(user_id, text, creation_time)| NewComment {
-            user_id: *user_id,
+        .into_iter()
+        .map(|(user_id, text, creation_time, last_edit_time)| OrphanedComment {
+            user_id,
             post_id: merge_to_id,
             text,
-            creation_time: *creation_time,
+            creation_time,
+            last_edit_time,
         })
         .collect();
     new_comments.insert_into(comment::table).execute(conn)?;

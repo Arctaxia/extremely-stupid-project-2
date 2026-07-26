@@ -39,14 +39,14 @@ pub fn reset_filenames_impl(state: &AppState) -> AdminResult<()> {
             }
 
             let Some(post_id) = admin::get_post_id(path) else {
-                error!("Could not find post_id of {path:?}");
+                error!("Could not find post_id of {}", path.display());
                 continue;
             };
 
-            let new_path = PostHash::new(&state.config, post_id).generated_thumbnail_path();
+            let new_path = PostHash::new(&state.config, post_id, None).generated_thumbnail_path();
             if path != new_path {
                 if let Err(err) = filesystem::move_file(path, &new_path) {
-                    error!("Could not move {path:?} to {new_path:?} for reason: {err}");
+                    error!("Could not move {} to {} for reason: {err}", path.display(), new_path.display());
                 }
                 progress.increment();
             }
@@ -64,14 +64,14 @@ pub fn reset_filenames_impl(state: &AppState) -> AdminResult<()> {
             }
 
             let Some(post_id) = admin::get_post_id(path) else {
-                error!("Could not find post_id of {path:?}");
+                error!("Could not find post_id of {}", path.display());
                 continue;
             };
 
-            let new_path = PostHash::new(&state.config, post_id).custom_thumbnail_path();
+            let new_path = PostHash::new(&state.config, post_id, None).custom_thumbnail_path();
             if path != new_path {
                 if let Err(err) = filesystem::move_file(path, &new_path) {
-                    error!("Could not move {path:?} to {new_path:?} for reason: {err}");
+                    error!("Could not move {} to {} for reason: {err}", path.display(), new_path.display());
                 }
                 progress.increment();
             }
@@ -89,12 +89,12 @@ pub fn reset_filenames_impl(state: &AppState) -> AdminResult<()> {
             }
 
             let Some(post_id) = admin::get_post_id(path) else {
-                error!("Could not find post_id of {path:?}");
+                error!("Could not find post_id of {}", path.display());
                 continue;
             };
 
             let new_path = if let Some(mime_type) = MimeType::from_path(path) {
-                PostHash::new(&state.config, post_id).content_path(mime_type)
+                PostHash::new(&state.config, post_id, None).content_path(mime_type)
             } else {
                 if let Some(extension) = path.extension().map(OsStr::to_string_lossy) {
                     warn!("Post {post_id} has unsupported file extension {extension}");
@@ -102,14 +102,14 @@ pub fn reset_filenames_impl(state: &AppState) -> AdminResult<()> {
                     warn!("Post {post_id} has no file extension");
                 }
 
-                let mut new_path = PostHash::new(&state.config, post_id).content_path(MimeType::Png);
+                let mut new_path = PostHash::new(&state.config, post_id, None).content_path(MimeType::Png);
                 new_path.set_extension(path.extension().unwrap_or(OsStr::new("")));
                 new_path
             };
 
             if path != new_path {
                 if let Err(err) = filesystem::move_file(path, &new_path) {
-                    error!("Could not move {path:?} to {new_path:?} for reason: {err}");
+                    error!("Could not move {} to {} for reason: {err}", path.display(), new_path.display());
                 }
                 progress.increment();
             }
@@ -140,7 +140,7 @@ pub fn reset_thumbnail_sizes_impl(state: &AppState) -> AdminResult<()> {
             }
 
             let Some(username) = path.file_name().map(OsStr::to_string_lossy) else {
-                error!("Unable to convert file name of {path:?} to string");
+                error!("Unable to convert file name of {} to string", path.display());
                 continue;
             };
 
@@ -164,7 +164,7 @@ pub fn reset_thumbnail_sizes_impl(state: &AppState) -> AdminResult<()> {
             }
 
             let Some(post_id) = admin::get_post_id(path) else {
-                error!("Could not find post_id of {path:?}");
+                error!("Could not find post_id of {}", path.display());
                 continue;
             };
 
@@ -188,7 +188,7 @@ pub fn reset_thumbnail_sizes_impl(state: &AppState) -> AdminResult<()> {
             }
 
             let Some(post_id) = admin::get_post_id(path) else {
-                error!("Could not find post_id of {path:?}");
+                error!("Could not find post_id of {}", path.display());
                 continue;
             };
 
@@ -431,7 +431,7 @@ pub fn reset_statistics_impl(state: &AppState) -> AdminResult<()> {
             }
 
             let Some(post_id) = admin::get_post_id(path) else {
-                error!("Could not find post_id of {path:?}");
+                error!("Could not find post_id of {}", path.display());
                 continue;
             };
 

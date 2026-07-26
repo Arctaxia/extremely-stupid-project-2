@@ -1,5 +1,6 @@
 use crate::api::error::{ApiError, ApiResult};
 use crate::config::Config;
+use crate::content::decode;
 use crate::content::hash::PostHash;
 use crate::content::thumbnail::ThumbnailCategory;
 use crate::content::upload::UploadToken;
@@ -8,7 +9,8 @@ use axum::body::Bytes;
 use futures::StreamExt;
 use image::error::ImageError;
 use image::{DynamicImage, ImageResult};
-use std::collections::HashSet;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::io::ErrorKind;
 use std::os::unix::fs::PermissionsExt;
@@ -17,7 +19,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use strum::{Display, IntoStaticStr};
 use tokio::fs::File;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWriteExt, BufWriter};
+use tokio::time::MissedTickBehavior;
 use tracing::warn;
 
 /// Represents important data directories.
@@ -37,42 +40,62 @@ pub fn file_size(path: &Path) -> std::io::Result<i64> {
         .map(|metadata| i64::try_from(metadata.len()).expect("File size must be less than i64::MAX"))
 }
 
-/// Saves streamed file contents to the temporary uploads folder as a `mime_type` file.
-/// Returns the name of the file written.
+/// Saves streamed file contents to the temporary uploads, inferring the MIME type from the
+/// content's magic bytes. Returns the name of the file written.
 ///
 /// Does not perform cleanup on error. It instead relies on the cleanup task spawned from
 /// `spawn_temporary_uploads_cleanup_task` to clean out failed uploads.
-pub async fn save_uploaded_file<S, E>(config: &Config, mut stream: S, mime_type: MimeType) -> ApiResult<UploadToken>
+pub async fn save_uploaded_file<S, E>(config: &Config, mut stream: S) -> ApiResult<UploadToken>
 where
     S: StreamExt<Item = Result<Bytes, E>> + Unpin,
     ApiError: From<E>,
 {
+    const KB: usize = 1024;
+    const MB: usize = 1024 * KB;
+    const SNIFF_LEN: usize = KB / 2;
+    const BUFFER_CAPACITY: usize = 4 * MB;
+
+    // Buffer enough of the stream to infer MIME type
+    let mut prefix = Vec::with_capacity(SNIFF_LEN);
+    while prefix.len() < SNIFF_LEN
+        && let Some(chunk) = stream.next().await
+    {
+        prefix.extend_from_slice(&chunk?);
+    }
+    let mime_type = decode::infer_mime_type(&prefix)?;
+
+    std::fs::create_dir_all(config.path(Directory::TemporaryUploads))?;
+
     let upload_token = UploadToken::new(mime_type);
     let upload_path = upload_token.path(config);
-    create_parent_directories(&upload_path)?;
 
-    let mut file = File::create(upload_path).await?;
+    // Create a buffered writer to reduce frequency of syscalls when writing file
+    let file = File::create(upload_path).await?;
+    let mut writer = BufWriter::with_capacity(BUFFER_CAPACITY, file);
+
+    writer.write_all(&prefix).await?;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
-        file.write_all(&chunk).await?;
+        writer.write_all(&chunk).await?;
     }
+    writer.flush().await?;
 
     Ok(upload_token)
 }
 
 /// Saves custom avatar `thumbnail` for user with name `username` to disk.
 /// Returns size of the thumbnail in bytes.
-pub fn save_custom_avatar(config: &Config, username: &str, thumbnail: &DynamicImage) -> ImageResult<i64> {
-    let avatar_path = config.custom_avatar_path(username);
-    create_parent_directories(&avatar_path)?;
+pub fn save_custom_avatar(config: &Config, lowercase_username: &str, thumbnail: DynamicImage) -> ImageResult<i64> {
+    std::fs::create_dir_all(config.path(Directory::Avatars))?;
 
-    thumbnail.to_rgb8().save(&avatar_path)?;
+    let avatar_path = config.custom_avatar_path(lowercase_username);
+    thumbnail.into_rgb8().save(&avatar_path)?;
     file_size(&avatar_path).map_err(ImageError::from)
 }
 
 /// Deletes custom avatar for user with name `username` from disk, if it exists.
-pub fn delete_custom_avatar(config: &Config, username: &str) -> std::io::Result<()> {
-    let custom_avatar_path = config.custom_avatar_path(username);
+pub fn delete_custom_avatar(config: &Config, lowercase_username: &str) -> std::io::Result<()> {
+    let custom_avatar_path = config.custom_avatar_path(lowercase_username);
     remove_if_exists(&custom_avatar_path)
 }
 
@@ -80,16 +103,16 @@ pub fn delete_custom_avatar(config: &Config, username: &str) -> std::io::Result<
 /// Returns size of the thumbnail in bytes.
 pub fn save_post_thumbnail(
     post: &PostHash,
-    thumbnail: &DynamicImage,
+    thumbnail: DynamicImage,
     thumbnail_type: ThumbnailCategory,
 ) -> ImageResult<i64> {
     let thumbnail_path = match thumbnail_type {
         ThumbnailCategory::Generated => post.generated_thumbnail_path(),
         ThumbnailCategory::Custom => post.custom_thumbnail_path(),
     };
-    create_parent_directories(&thumbnail_path)?;
+    std::fs::create_dir_all(thumbnail_path.parent().unwrap_or(Path::new("")))?;
 
-    thumbnail.to_rgb8().save(&thumbnail_path)?;
+    thumbnail.into_rgb8().save(&thumbnail_path)?;
     file_size(&thumbnail_path).map_err(ImageError::from)
 }
 
@@ -105,7 +128,7 @@ pub fn delete_post_thumbnail(post: &PostHash, thumbnail_type: ThumbnailCategory)
 /// Deletes `post` content from disk.
 pub fn delete_content(post: &PostHash, mime_type: MimeType) -> std::io::Result<()> {
     let content_path = post.content_path(mime_type);
-    std::fs::remove_file(content_path)
+    remove_if_exists(&content_path)
 }
 
 /// Deletes `post` thumbnails and content from disk.
@@ -151,7 +174,7 @@ pub fn swap_posts(
 /// Tries simply renaming first and falls back to copy/remove if `from` and `to`
 /// are on different file systems.
 pub fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
-    create_parent_directories(to)?;
+    std::fs::create_dir_all(to.parent().unwrap_or(Path::new("")))?;
     if let Err(err) = std::fs::rename(from, to) {
         if err.kind() == ErrorKind::CrossesDevices {
             std::fs::copy(from, to)?;
@@ -164,19 +187,7 @@ pub fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
     // Set appropriate permissions since we usually use this function to move
     // content to a permanent location
     if let Err(err) = set_permissions(to) {
-        warn!("Failed to set permissions for {to:?} for reason: {err}");
-    }
-    Ok(())
-}
-
-/// Deletes everything in the temporary uploads directory.
-pub fn purge_temporary_uploads(config: &Config) -> std::io::Result<()> {
-    let temporary_uploads_path = config.path(Directory::TemporaryUploads);
-    if temporary_uploads_path.try_exists()? {
-        for entry in std::fs::read_dir(temporary_uploads_path)? {
-            let path = entry?.path();
-            std::fs::remove_file(path)?;
-        }
+        warn!("Failed to set permissions for {} for reason: {err}", to.display());
     }
     Ok(())
 }
@@ -184,20 +195,15 @@ pub fn purge_temporary_uploads(config: &Config) -> std::io::Result<()> {
 /// Spawns an asynchronous task that periodically checks the temporary
 /// upload directory for stale file uploads and deletes them.
 pub fn spawn_temporary_uploads_cleanup_task(config: Arc<Config>) {
-    const CLEANUP_INTERVAL: Duration = Duration::from_mins(10);
+    const SWEEP_INTERVAL: Duration = Duration::from_hours(1);
 
     tokio::spawn(async move {
-        let mut stale_uploads = HashSet::new();
-        let mut interval = tokio::time::interval(CLEANUP_INTERVAL);
+        let mut uploads = HashMap::new();
+        let mut interval = tokio::time::interval(SWEEP_INTERVAL);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
-            match remove_stale_uploads(&config, &stale_uploads) {
-                Ok(current_uploads) => stale_uploads = current_uploads,
-                Err(err) => {
-                    tracing::warn!("Failed to cleanup temporary uploads directory: {err}");
-                    stale_uploads = HashSet::new();
-                }
-            }
+            remove_stale_uploads(&config, &mut uploads);
         }
     });
 }
@@ -213,24 +219,64 @@ fn remove_if_exists(file: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Removes any files in the temporary uploads directory that are contained within `stale_uploads`.
-/// Returns a set of files that are currently in the temporary uploads directory.
-fn remove_stale_uploads(config: &Config, stale_uploads: &HashSet<PathBuf>) -> std::io::Result<HashSet<PathBuf>> {
+/// Removes any stale files in the temporary uploads directory that are contained within `uploads`.
+fn remove_stale_uploads(config: &Config, uploads: &mut HashMap<PathBuf, u64>) {
     let temporary_uploads_path = config.path(Directory::TemporaryUploads);
-    if !temporary_uploads_path.try_exists()? {
-        return Ok(HashSet::new());
-    }
+    let directory_iter = match std::fs::read_dir(temporary_uploads_path) {
+        Ok(iter) => iter,
+        Err(err) => {
+            if err.kind() == ErrorKind::NotFound {
+                // Directory must have been deleted after startup. Clear uploads map
+                uploads.clear();
+            } else {
+                warn!("Failed to cleanup temporary uploads directory: {err}");
+            }
+            return;
+        }
+    };
 
-    let mut current_uploads = HashSet::new();
-    for entry in std::fs::read_dir(temporary_uploads_path)? {
-        let path = entry?.path();
-        if stale_uploads.contains(&path) {
-            remove_if_exists(&path)?;
-        } else {
-            current_uploads.insert(path);
+    let mut seen_files = HashSet::new();
+    for file in directory_iter {
+        let path = match file {
+            Ok(entry) => entry.path(),
+            Err(err) => {
+                warn!("Failed to read directory entry: {err}");
+                continue;
+            }
+        };
+        let filesize = match path.metadata() {
+            Ok(metadata) => metadata.len(),
+            Err(err) => {
+                if err.kind() != ErrorKind::NotFound {
+                    warn!("Failed to read metadata for {}: {err}", path.display());
+                    seen_files.insert(path);
+                }
+                continue;
+            }
+        };
+
+        match uploads.entry(path.clone()) {
+            Entry::Occupied(mut entry) => {
+                // If filesize has grown, assume file is still downloading and don't delete
+                if filesize > *entry.get() {
+                    *entry.get_mut() = filesize;
+                    seen_files.insert(path);
+                } else if let Err(err) = remove_if_exists(&path) {
+                    warn!("Failed to remove {}: {err}", path.display());
+                    seen_files.insert(path);
+                } else {
+                    entry.remove();
+                }
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(filesize);
+                seen_files.insert(path);
+            }
         }
     }
-    Ok(current_uploads)
+
+    // Drop entries for files that no longer exist
+    uploads.retain(|path, _| seen_files.contains(path));
 }
 
 /// Swaps the names of two files.
@@ -243,22 +289,11 @@ fn swap_files(config: &Config, file_a: &Path, file_b: &Path) -> std::io::Result<
     move_file(&temp_path, file_b)
 }
 
-/// Makes `path` writable by the process. Used to avoid permissions issues on some systems.
+/// Makes `path` readable to world. Used to avoid permissions issues on some systems.
 fn set_permissions(path: &Path) -> std::io::Result<()> {
     const STANDARD_PERMISSIONS: u32 = 0o644;
 
     let mut permissions = std::fs::metadata(path)?.permissions();
     permissions.set_mode(STANDARD_PERMISSIONS);
     std::fs::set_permissions(path, permissions)
-}
-
-/// For a given `path`, recusively creates all parent directories if they don't already exist.
-fn create_parent_directories(path: &Path) -> std::io::Result<()> {
-    if let Err(err) = std::fs::create_dir_all(path.parent().unwrap_or(Path::new("")))
-        && err.kind() != std::io::ErrorKind::AlreadyExists
-    {
-        Err(err)
-    } else {
-        Ok(())
-    }
 }

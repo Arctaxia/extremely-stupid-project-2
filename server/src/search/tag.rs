@@ -1,6 +1,5 @@
 use crate::api::error::{ApiError, ApiResult};
 use crate::app::Context;
-use crate::model::enums::UserRank;
 use crate::model::tag::TagName;
 use crate::schema::{
     database_statistics, tag, tag_category, tag_implication, tag_name, tag_statistics, tag_suggestion,
@@ -99,7 +98,7 @@ impl<'a> Builder<'a> for QueryBuilder<'a> {
             order: Order::default(),
         });
         let sorts = self.search.sorts.iter().copied().chain(default_sort);
-        let unsorted_query = unsorted_query.inner_join(tag_name::table).filter(TagName::primary());
+        let unsorted_query = unsorted_query.inner_join(tag_name::table).filter(TagName::is_primary());
         let query = sorts.fold(unsorted_query, |query, sort| match sort.kind {
             Token::CreationTime => apply_sort!(query, tag::id, sort),
             Token::LastEditTime => apply_sort!(query, tag::last_edit_time, sort),
@@ -123,10 +122,8 @@ impl<'a> Builder<'a> for QueryBuilder<'a> {
 impl<'a> QueryBuilder<'a> {
     pub fn new(ctx: &'a Context, search_criteria: &'a str) -> ApiResult<Self> {
         let mut search = SearchCriteria::new(ctx, search_criteria, Token::Name).map_err(Box::from)?;
-        if ctx.client.rank == UserRank::Anonymous {
-            let preferences = &ctx.config.anonymous_preferences;
-
-            let tag_blacklist_filters = preferences.tag_blacklist.iter().map(|condition| UnparsedFilter {
+        if !ctx.preferences().is_empty() {
+            let tag_blacklist_filters = ctx.preferences().tag_blacklist.iter().map(|condition| UnparsedFilter {
                 kind: Token::Name,
                 condition,
                 negated: true,
@@ -134,7 +131,7 @@ impl<'a> QueryBuilder<'a> {
             search.filters.extend(tag_blacklist_filters);
 
             let category_blacklist_filters =
-                preferences
+                ctx.preferences()
                     .tag_category_blacklist
                     .iter()
                     .map(|condition| UnparsedFilter {
@@ -147,7 +144,7 @@ impl<'a> QueryBuilder<'a> {
 
         Ok(Self {
             search,
-            cache_state: CacheState::new(),
+            cache_state: CacheState::default(),
         })
     }
 }
